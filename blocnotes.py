@@ -662,28 +662,38 @@ def unescape_extended(s):
 def build_pattern(find, mode="normal", case=False, word=False, dotall=False):
     if not find:
         raise ValueError("rien à rechercher")
+    lead, exact = "", False
     if mode == "regex":
-        src = find
+        converted = pcre_to_python(find)
+        lead, src = split_global_flags(converted)
+        exact = converted == find           # positions d'erreur fiables dans le texte tapé
     else:
         src = re.escape(unescape_extended(find) if mode == "extended" else find)
+    prefix = f"(?{lead})" if lead else ""
+    body_at = len(prefix)
     if word:
-        src = r"(?<!\w)(?:" + src + r")(?!\w)"
+        src = r"(?<!\w)(?:" + src + ("\n" if "x" in lead else "") + r")(?!\w)"
+        body_at += len(r"(?<!\w)(?:")
     flags = re.MULTILINE | (0 if case else re.IGNORECASE) | (re.DOTALL if dotall else 0)
     try:
-        return re.compile(src, flags)
+        return re.compile(prefix + src, flags)
     except re.error as exc:
-        raise ValueError(f"expression régulière invalide : {exc}") from None
+        typed_lead = len(find) - len(split_global_flags(find)[1]) if mode == "regex" else 0
+        shift = body_at - typed_lead
+        msg, pos = french_re_error(exc, shift if exact else 10 ** 9)
+        err = ValueError(f"expression régulière invalide : {msg}")
+        err.pos = pos
+        raise err from None
 
 
 def make_replacer(repl, mode):
-    """Remplacement façon Notepad++ : $1, ${1} ou \\1 pour les groupes en mode regex."""
+    """Remplacement façon Notepad++ : $1, ${1}, ${nom}, $& ou \\1 pour les groupes en mode regex."""
     if mode == "normal":
         return lambda m: repl
     if mode == "extended":
         literal = unescape_extended(repl)
         return lambda m: literal
-    tpl = re.sub(r"\$\{(\d+)\}|\$(\d+)", lambda m: "\\g<" + (m.group(1) or m.group(2)) + ">", repl)
-    tpl = re.sub(r"\\(\d+)", r"\\g<\1>", tpl)
+    tpl = npp_repl_template(repl)
     return lambda m: m.expand(tpl)
 
 
@@ -737,6 +747,883 @@ def find_in_text(text, pattern, limit=100000):
         if len(out) >= limit:
             break
     return out
+
+
+# ======================================================================================
+# Expressions régulières : compatibilité, explication, générateur, exemples d'utilisation
+# ======================================================================================
+
+try:                                    # analyseur d'expressions de Python (pur Python, hors réseau)
+    from re import _parser as _sre_parse          # Python 3.11 et plus
+except ImportError:                     # pragma: no cover - anciens Python
+    import sre_parse as _sre_parse
+
+_GLOBAL_FLAGS = re.compile(r"\(\?([aiLmsux]+)\)")
+_NAME = re.compile(r"[A-Za-z_]\w*")
+
+
+def split_global_flags(src):
+    """« (?i)(?m)abc » -> ("im", "abc") : options globales placées en tête."""
+    letters = ""
+    while True:
+        m = _GLOBAL_FLAGS.match(src)
+        if not m:
+            return letters, src
+        letters += "".join(c for c in m.group(1) if c not in letters)
+        src = src[m.end():]
+
+
+def pcre_to_python(src):
+    """Accepte aussi les écritures PCRE / Notepad++ : (?<nom>…), (?'nom'…), \\k<nom>, \\z."""
+    out, i, n, in_class = [], 0, len(src), False
+    while i < n:
+        c = src[i]
+        if c == "\\" and i + 1 < n:
+            nxt = src[i + 1]
+            if not in_class and nxt == "k" and i + 2 < n and src[i + 2] in "<{'":
+                close = {"<": ">", "{": "}", "'": "'"}[src[i + 2]]
+                j = src.find(close, i + 3)
+                if j > 0 and _NAME.fullmatch(src[i + 3:j]):
+                    out.append(f"(?P={src[i + 3:j]})")
+                    i = j + 1
+                    continue
+            if nxt == "z" and not in_class:
+                out.append(r"\Z")
+            else:
+                out.append(src[i:i + 2])
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            out.append(c)
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            out.append(c)
+            i += 1
+            if i < n and src[i] == "^":
+                out.append("^")
+                i += 1
+            if i < n and src[i] == "]":
+                out.append("]")
+                i += 1
+            continue
+        if src.startswith("(?<", i) and i + 3 < n and (src[i + 3].isalpha() or src[i + 3] == "_"):
+            out.append("(?P<")
+            i += 3
+            continue
+        if src.startswith("(?'", i):
+            j = src.find("'", i + 3)
+            if j > 0 and _NAME.fullmatch(src[i + 3:j]):
+                out.append(f"(?P<{src[i + 3:j]}>")
+                i = j + 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+_RE_ERRORS = (
+    ("missing ), unterminated subpattern", "parenthèse « ) » manquante"),
+    ("unbalanced parenthesis", "parenthèse « ) » en trop"),
+    ("unterminated character set", "crochet « ] » manquant"),
+    ("nothing to repeat", "rien à répéter avant ce quantificateur"),
+    ("multiple repeat", "deux quantificateurs à la suite (par ex. « ** »)"),
+    ("bad escape", "séquence avec antislash inconnue"),
+    ("bad character range", "intervalle invalide entre crochets (par ex. « z-a »)"),
+    ("look-behind requires fixed-width pattern", "un « précédé de » (?<=…) doit avoir une longueur fixe"),
+    ("unknown group name", "nom de groupe inconnu"),
+    ("invalid group reference", "référence à un groupe qui n'existe pas"),
+    ("cannot refer to an open group", "référence à un groupe pas encore fermé"),
+    ("missing group name", "nom de groupe manquant"),
+    ("bad character in group name", "caractère interdit dans le nom de groupe"),
+    ("redefinition of group name", "nom de groupe utilisé deux fois"),
+    ("global flags not at the start", "les options comme (?i) doivent être au tout début"),
+    ("unknown extension", "construction « (?… » inconnue"),
+    ("unknown flag", "option inconnue dans « (?…) »"),
+    ("missing ), unterminated name", "« > » manquant après le nom du groupe"),
+    ("missing >, unterminated name", "« > » manquant après le nom du groupe"),
+    ("min repeat greater than max repeat", "dans {n,m}, n est plus grand que m"),
+    ("the repetition number is too large", "nombre de répétitions trop grand"),
+    ("missing ), unterminated comment", "commentaire (?#…) non fermé"),
+    ("unterminated", "élément non fermé"),
+)
+
+
+def french_re_error(exc, offset=0):
+    """Message d'erreur de `re` traduit, avec la position dans le texte tapé."""
+    msg = str(getattr(exc, "msg", "") or exc)
+    for en, fr in _RE_ERRORS:
+        if msg.startswith(en):
+            detail = msg[len(en):].strip(" :")
+            msg = fr + (f" ({detail})" if detail and en == "bad escape" else "")
+            break
+    pos = getattr(exc, "pos", None)
+    if isinstance(pos, int) and pos - offset >= 0:
+        return f"{msg} — position {pos - offset + 1}", pos - offset
+    return msg, None
+
+
+def npp_repl_template(repl):
+    """Remplacement Notepad++ ($1, ${1}, ${nom}, $+{nom}, $&, \\1, \\$) -> modèle Python (\\g<1>)."""
+    def conv(m):
+        t = m.group(0)
+        if t == "\\\\":
+            return t
+        if t == "\\$":
+            return "$"
+        if t == "$&":
+            return r"\g<0>"
+        return "\\g<" + next(g for g in m.groups() if g is not None) + ">"
+    return re.sub(r"\\\\|\\\$|\$\{(\w+)\}|\$\+\{(\w+)\}|\$(\d+)|\$&|\\(\d+)", conv, repl)
+
+
+# ---- explication en français ------------------------------------------------------------
+
+_CATEGORIES = {
+    "CATEGORY_DIGIT": ("un chiffre (\\d)", "chiffre"),
+    "CATEGORY_NOT_DIGIT": ("un caractère qui n'est pas un chiffre (\\D)", "non-chiffre"),
+    "CATEGORY_SPACE": ("un blanc : espace, tabulation, retour à la ligne… (\\s)", "blanc"),
+    "CATEGORY_NOT_SPACE": ("un caractère qui n'est pas un blanc (\\S)", "non-blanc"),
+    "CATEGORY_WORD": ("une lettre, un chiffre ou « _ » (\\w)", "lettre, chiffre ou _"),
+    "CATEGORY_NOT_WORD": ("un caractère qui n'est ni lettre, ni chiffre, ni « _ » (\\W)", "hors lettre/chiffre/_"),
+}
+_CHAR_NAMES = {" ": "espace", "\t": "tabulation (\\t)", "\n": "retour à la ligne (\\n)",
+               "\r": "retour chariot (\\r)", "\x00": "caractère nul (\\0)"}
+
+
+def _char_name(code):
+    ch = chr(code)
+    if ch in _CHAR_NAMES:
+        return _CHAR_NAMES[ch]
+    return f"« {ch} »" if ch.isprintable() else f"U+{code:04X}"
+
+
+def _visible(text):
+    return text.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def _quantity(lo, hi, kind):
+    inf = hi == _sre_parse.MAXREPEAT
+    if (lo, hi) == (0, 1):
+        s = "facultatif (0 ou 1 fois)"
+    elif lo == 0 and inf:
+        s = "0 fois ou plus"
+    elif lo == 1 and inf:
+        s = "1 fois ou plus"
+    elif inf:
+        s = f"au moins {lo} fois"
+    elif lo == hi:
+        s = f"exactement {lo} fois"
+    else:
+        s = f"de {lo} à {hi} fois"
+    if kind == "MIN_REPEAT":
+        s += ", le moins possible"
+    elif kind == "POSSESSIVE_REPEAT":
+        s += ", sans retour en arrière"
+    return s
+
+
+def explain_regex(pattern):
+    """Explication pas à pas d'un motif compilé -> (texte, alertes)."""
+    flags = pattern.flags
+    names = {v: k for k, v in pattern.groupindex.items()}
+    multiline, dotall = bool(flags & re.MULTILINE), bool(flags & re.DOTALL)
+    warnings = []
+    try:
+        tree = _sre_parse.parse(pattern.pattern, flags)
+    except Exception:  # noqa: BLE001 - l'explication est un bonus, jamais bloquante
+        return "", []
+
+    def unbounded(items):
+        for op, av in items:
+            name = str(op)
+            if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+                if av[1] == _sre_parse.MAXREPEAT or unbounded(av[2]):
+                    return True
+            elif name == "SUBPATTERN" and unbounded(av[-1]):
+                return True
+            elif name == "BRANCH" and any(unbounded(alt) for alt in av[1]):
+                return True
+            elif name in ("ASSERT", "ASSERT_NOT") and unbounded(av[1]):
+                return True
+            elif name == "ATOMIC_GROUP" and unbounded(av):
+                return True
+        return False
+
+    def in_set(av):
+        neg, parts = False, []
+        for op, a in av:
+            name = str(op)
+            if name == "NEGATE":
+                neg = True
+            elif name == "LITERAL":
+                parts.append(_char_name(a))
+            elif name == "RANGE":
+                parts.append(f"{_visible(chr(a[0]))} à {_visible(chr(a[1]))}")
+            elif name == "CATEGORY":
+                parts.append(_CATEGORIES.get(str(a), (str(a), str(a)))[1])
+            else:
+                parts.append(name.lower())
+        if len(parts) == 1 and not neg and len(av) == 1 and str(av[0][0]) == "CATEGORY":
+            return _CATEGORIES.get(str(av[0][1]), (parts[0],))[0]
+        return ("un caractère sauf : " if neg else "un caractère parmi : ") + ", ".join(parts)
+
+    def atom(op, av):
+        name = str(op)
+        if name == "LITERAL":
+            return "le caractère " + _char_name(av)
+        if name == "NOT_LITERAL":
+            return "n'importe quel caractère sauf " + _char_name(av)
+        if name == "ANY":
+            return "n'importe quel caractère" + (" (retours à la ligne compris)" if dotall
+                                                 else " sauf un retour à la ligne")
+        if name == "IN":
+            return in_set(av)
+        if name == "AT":
+            at = str(av)
+            return {
+                "AT_BEGINNING": "début de ligne (^)" if multiline else "début du texte (^)",
+                "AT_BEGINNING_LINE": "début de ligne (^)",
+                "AT_BEGINNING_STRING": "tout début du texte (\\A)",
+                "AT_END": "fin de ligne ($)" if multiline else "fin du texte ($)",
+                "AT_END_LINE": "fin de ligne ($)",
+                "AT_END_STRING": "toute fin du texte (\\Z)",
+                "AT_BOUNDARY": "limite de mot (\\b)",
+                "AT_NON_BOUNDARY": "pas en limite de mot (\\B)",
+            }.get(at, at.lower())
+        if name == "GROUPREF":
+            label = f" « {names[av]} »" if av in names else ""
+            return f"le même texte que celui trouvé par le groupe {av}{label}"
+        return None
+
+    def inline(items):
+        items = list(items)
+        if not items:
+            return "rien"
+        if all(str(op) == "LITERAL" for op, _ in items):
+            text = "".join(chr(av) for _, av in items)
+            return "le caractère " + _char_name(ord(text)) if len(text) == 1 else f"le texte « {_visible(text)} »"
+        if len(items) == 1:
+            op, av = items[0]
+            one = atom(op, av)
+            if one:
+                return one
+            if str(op) in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+                inner = inline(av[2])
+                if inner and "\n" not in inner and len(inner) < 90:
+                    return f"{inner}, {_quantity(av[0], av[1], str(op))}"
+        return None
+
+    lines = []
+
+    def add(depth, text):
+        lines.append((depth, text[:1].upper() + text[1:]))
+
+    def walk(items, depth):
+        items = list(items)
+        i = 0
+        while i < len(items):
+            op, av = items[i]
+            name = str(op)
+            if name == "LITERAL":
+                j = i
+                while j < len(items) and str(items[j][0]) == "LITERAL":
+                    j += 1
+                add(depth, inline(items[i:j]))
+                i = j
+                continue
+            i += 1
+            one = atom(op, av)
+            if one:
+                add(depth, one)
+            elif name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+                lo, hi, sub = av
+                if hi == _sre_parse.MAXREPEAT and unbounded(sub) and not warnings:
+                    warnings.append("Quantificateur imbriqué (du genre « (a+)+ ») : sur un long texte "
+                                    "sans correspondance, la recherche peut tourner très longtemps.")
+                text = inline(sub)
+                if text and len(text) < 90:
+                    add(depth, f"{text}, {_quantity(lo, hi, name)}")
+                else:
+                    add(depth, (_quantity(lo, hi, name) if (lo, hi) == (0, 1)
+                                else "répéter " + _quantity(lo, hi, name)) + " :")
+                    walk(sub, depth + 1)
+            elif name == "SUBPATTERN":
+                group, sub = av[0], av[-1]
+                if group is None:
+                    head = "groupe non capturé"
+                else:
+                    head = f"groupe {group}" + (f" « {names[group]} »" if group in names else "") + " (capturé)"
+                add_flags = av[1] if len(av) == 4 else 0
+                if add_flags & re.IGNORECASE:
+                    head += ", majuscules et minuscules confondues"
+                text = inline(sub)
+                if text and len(text) < 90:
+                    add(depth, f"{head} : {text}")
+                else:
+                    add(depth, head + " :")
+                    walk(sub, depth + 1)
+            elif name == "BRANCH":
+                alts = av[1]
+                texts = [inline(alt) for alt in alts]
+                if all(texts) and sum(len(t) for t in texts) < 160:
+                    texts = [t[len("le texte "):] if t.startswith("le texte « ") else t for t in texts]
+                    add(depth, "au choix : " + (", ".join(texts[:-1]) + " ou " + texts[-1]))
+                else:
+                    add(depth, "au choix, l'une de ces possibilités :")
+                    for k, alt in enumerate(alts, 1):
+                        add(depth + 1, f"possibilité {k} :")
+                        walk(alt, depth + 2)
+            elif name in ("ASSERT", "ASSERT_NOT"):
+                direction, sub = av
+                head = {("ASSERT", 1): "suivi de", ("ASSERT", -1): "précédé de",
+                        ("ASSERT_NOT", 1): "non suivi de", ("ASSERT_NOT", -1): "non précédé de"}[
+                    (name, 1 if direction >= 0 else -1)]
+                head += " (vérifié sans faire partie du résultat)"
+                text = inline(sub)
+                if text and len(text) < 90:
+                    add(depth, f"{head} : {text}")
+                else:
+                    add(depth, head + " :")
+                    walk(sub, depth + 1)
+            elif name == "ATOMIC_GROUP":
+                add(depth, "groupe atomique (sans retour en arrière) :")
+                walk(av, depth + 1)
+            elif name == "GROUPREF_EXISTS":
+                cond, yes, no = av
+                add(depth, f"si le groupe {cond} a trouvé quelque chose :")
+                walk(yes, depth + 1)
+                if no:
+                    add(depth, "sinon :")
+                    walk(no, depth + 1)
+            else:
+                add(depth, name.lower().replace("_", " "))
+
+    walk(tree, 0)
+    opts = ["majuscules et minuscules confondues" if flags & re.IGNORECASE else "respecte la casse",
+            "^ et $ à chaque ligne" if multiline else "^ et $ au début et à la fin du texte"]
+    if dotall:
+        opts.append("« . » prend aussi les retours à la ligne")
+    if flags & re.VERBOSE:
+        opts.append("mode verbeux (espaces et # ignorés)")
+    out, num = ["Options : " + ", ".join(opts), ""], 0
+    for depth, text in lines:
+        if depth == 0:
+            num += 1
+            out.append(f"{num}. {text}")
+        else:
+            out.append("    " * depth + "– " + text)
+    if pattern.groups:
+        out.append("")
+        out.append(f"Groupes capturés : {pattern.groups}" + (
+            " (" + ", ".join(f"{k} = {v}" for k, v in sorted(names.items())) + ")" if names else ""))
+    return "\n".join(out), warnings
+
+
+# ---- générateur à partir d'exemples -------------------------------------------------------
+
+_SPECIAL = set(".^$*+?{}[]\\|()")
+
+
+def _esc(text):
+    out = []
+    for ch in text:
+        if ch in _SPECIAL:
+            out.append("\\" + ch)
+        elif ch == "\t":
+            out.append(r"\t")
+        elif ch == "\n":
+            out.append(r"\n")
+        elif ch == "\r":
+            out.append(r"\r")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _class_of(chars):
+    chars = sorted(set(chars))
+    dash = "-" in chars
+    body = "".join(("\\" + c) if c in "\\]^[" else c for c in chars if c != "-")
+    return "[" + body + ("-" if dash else "") + "]"
+
+
+def _tokenize(sample):
+    out = []
+    for m in re.finditer(r"\w+|\s+|.", sample, re.S):
+        t = m.group(0)
+        out.append(("w" if (t[0].isalnum() or t[0] == "_") else "s" if t.isspace() else "p", t))
+    return out
+
+
+def _word_class(values):
+    chars = set("".join(values))
+    if any(not c.isascii() for c in chars):
+        return r"\w", False
+    digits = any(c.isdigit() for c in chars)
+    lower = any(c.islower() for c in chars)
+    upper = any(c.isupper() for c in chars)
+    under = "_" in chars
+    letters = {c for c in chars if c.isalpha()}
+    if digits and not letters and not under:
+        return r"\d", False
+    if digits and letters and not under:
+        if letters <= set("abcdef"):
+            return "[0-9a-f]", False
+        if letters <= set("ABCDEF"):
+            return "[0-9A-F]", False
+    if (not digits and not under and all(len(v) > 1 and v[0].isupper() and v[1:].islower() for v in values)):
+        return "[A-Z][a-z]", True                     # Mot Capitalisé
+    if lower and upper and digits and under:
+        return r"\w", False
+    return "[" + ("A-Z" if upper else "") + ("a-z" if lower else "") + ("0-9" if digits else "") + \
+        ("_" if under else "") + "]", False
+
+
+def _quant(lengths, flexible):
+    lo, hi = min(lengths), max(lengths)
+    if flexible:
+        return "+" if lo >= 1 else "*"
+    if lo == hi:
+        return "" if lo == 1 else f"{{{lo}}}"
+    return f"{{{lo},{hi}}}"
+
+
+def regex_from_examples(examples, keep_same=True, keep_words=False, flexible=False, anchors=False,
+                        capture=False):
+    """Fabrique une expression qui reconnaît tous les exemples (un par ligne) -> (regex, explication)."""
+    samples = [s.rstrip("\r") for s in examples if s.strip()]
+    if not samples:
+        raise ValueError("colle au moins un exemple")
+    groups = {}
+    for s in samples:
+        toks = _tokenize(s)
+        groups.setdefault(tuple(k for k, _ in toks), []).append(toks)
+    parts = []
+    for sig, members in groups.items():
+        several = len(members) > 1
+        out = []
+        for pos, kind in enumerate(sig):
+            values = [m[pos][1] for m in members]
+            distinct = list(dict.fromkeys(values))
+            if kind == "p":
+                out.append(_esc(distinct[0]) if len(distinct) == 1 else _class_of(distinct))
+                continue
+            if kind == "s":
+                if len(distinct) == 1 and not flexible:
+                    v = distinct[0]
+                    piece = _esc(v[0]) + ("" if len(v) == 1 else f"{{{len(v)}}}") if len(set(v)) == 1 \
+                        else r"\s" + _quant([len(v)], False)
+                else:
+                    piece = r"\s" + _quant([len(v) for v in values], flexible)
+                out.append(piece)
+                continue
+            if (keep_same and several and len(distinct) == 1) or \
+                    (keep_words and len(distinct) == 1 and distinct[0].isalpha()):
+                out.append(_esc(distinct[0]))
+                continue
+            if keep_words and all(v.isalpha() for v in distinct) and len(distinct) <= 6:
+                alt = "|".join(_esc(v) for v in distinct)
+                out.append(f"({alt})" if capture else f"(?:{alt})")
+                continue
+            cls, capitalized = _word_class(values)
+            if capitalized:
+                piece = cls + _quant([len(v) - 1 for v in values], flexible)
+            else:
+                piece = cls + _quant([len(v) for v in values], flexible)
+            out.append(f"({piece})" if capture else piece)
+        parts.append("".join(out))
+    body = parts[0] if len(parts) == 1 else "(?:" + "|".join(parts) + ")"
+    regex = ("^" + body + "$") if anchors else body
+    n = len(samples)
+    info = f"{n} exemple{'s' if n > 1 else ''}"
+    if len(parts) > 1:
+        info += f", {len(parts)} formes différentes : une alternative par forme."
+    elif n > 1:
+        info += ", tous de la même forme."
+    else:
+        info += " : ajoute d'autres exemples (un par ligne) pour une expression plus juste."
+    return regex, info
+
+
+# ---- exemples d'utilisation : Python, Ansible, grep -------------------------------------------
+
+def _py_literal(s):
+    if "'" not in s and not s.endswith("\\") and "\n" not in s:
+        return "r'" + s + "'"
+    if '"' not in s and not s.endswith("\\") and "\n" not in s:
+        return 'r"' + s + '"'
+    return repr(s)
+
+
+def jinja_literal(s):
+    """Chaîne Jinja2 entre apostrophes : Jinja interprète les antislashs, on les double."""
+    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def yaml_double(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def shell_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def to_posix_ere(src):
+    """Conversion au mieux vers grep -E (POSIX) -> (ere, alertes, ok)."""
+    out, warn, i, n, ok = [], [], 0, len(src), True
+
+    def note(msg, fatal=False):
+        nonlocal ok
+        if msg not in warn:
+            warn.append(msg)
+        if fatal:
+            ok = False
+
+    lead, src = split_global_flags(src)
+    n = len(src)
+    if set(lead) - {"i", "m"}:
+        note("options (?s)/(?x)/(?a) ignorées par grep")
+    shorthand = {"d": "[0-9]", "D": "[^0-9]", "w": "[[:alnum:]_]", "W": "[^[:alnum:]_]",
+                 "s": "[[:space:]]", "S": "[^[:space:]]", "A": "^", "Z": "$", "z": "$"}
+
+    def lazy_after():
+        nonlocal i
+        if i < n and src[i] in "?+":
+            note("quantificateurs « le moins possible » (*? +? ??) ou possessifs : remplacés "
+                 "par la version normale")
+            i += 1
+
+    while i < n:
+        c = src[i]
+        if c == "\\" and i + 1 < n:
+            e = src[i + 1]
+            i += 2
+            if e in shorthand:
+                out.append(shorthand[e])
+            elif e in "bB":
+                out.append("\\" + e)
+            elif e.isdigit():
+                out.append("\\" + e)
+                note("références arrière (\\1…) : pas garanties avec grep -E")
+            elif e in "nr":
+                note("grep travaille ligne par ligne : \\n et \\r ne peuvent pas marcher", True)
+            elif e == "t":
+                out.append("\t")
+                note("\\t remplacé par une vraie tabulation")
+            elif e.isalnum():
+                note(f"\\{e} n'existe pas en POSIX", True)
+            else:
+                out.append("\\" + e)
+            continue
+        if c == "[":
+            j, neg = i + 1, False
+            if j < n and src[j] == "^":
+                neg, j = True, j + 1
+            items, has_close, has_dash, has_caret, has_bs, first = [], False, False, False, False, True
+            while j < n and not (src[j] == "]" and not first):
+                ch = src[j]
+                if ch == "\\" and j + 1 < n:
+                    e = src[j + 1]
+                    j += 2
+                    if e in "dws":
+                        items.append({"d": "0-9", "w": "[:alnum:]_", "s": "[:space:]"}[e])
+                    elif e in "DWS":
+                        note(f"\\{e} entre crochets n'existe pas en POSIX", True)
+                    elif e == "]":
+                        has_close = True
+                    elif e == "-":
+                        has_dash = True
+                    elif e == "^":
+                        has_caret = True
+                    elif e == "\\":
+                        has_bs = True
+                    elif e == "t":
+                        items.append("\t")
+                    elif e.isalnum():
+                        note(f"\\{e} entre crochets n'existe pas en POSIX", True)
+                    else:
+                        items.append(e)
+                elif ch == "]" and first:
+                    has_close, j = True, j + 1
+                elif ch == "-" and (first or (j + 1 < n and src[j + 1] == "]")):
+                    has_dash, j = True, j + 1
+                else:
+                    items.append(ch)
+                    j += 1
+                first = False
+            body = ("]" if has_close else "") + "".join(items) + ("\\" if has_bs else "")
+            if has_caret:
+                body += "^" if body else ""
+            body += "-" if has_dash else ""
+            if not body and has_caret:
+                out.append("\\^")
+            else:
+                out.append("[" + ("^" if neg else "") + body + "]")
+            i = j + 1
+            continue
+        if c == "(" and src.startswith("(?", i):
+            if src.startswith("(?:", i):
+                out.append("(")
+                i += 3
+            elif src.startswith("(?P<", i):
+                j = src.find(">", i)
+                out.append("(")
+                i = j + 1 if j > 0 else n
+                note("noms de groupes retirés (grep ne les connaît pas)")
+            elif src.startswith("(?#", i):
+                j = src.find(")", i)
+                i = j + 1 if j > 0 else n
+            else:
+                kind = ("« suivi de / précédé de » (?=, ?!, ?<=, ?<!)" if src[i + 2:i + 3] in "=!<"
+                        else f"la construction « {src[i:i + 4]}… »")
+                note(f"grep -E ne connaît pas {kind}", True)
+                out.append("(")
+                i += 2
+                while i < n and src[i] not in ":=!>)":
+                    i += 1
+                i += 1 if i < n and src[i] != ")" else 0
+            continue
+        if c in "*+?":
+            out.append(c)
+            i += 1
+            lazy_after()
+            continue
+        if c == "{":
+            m = re.match(r"\{\d*(?:,\d*)?\}", src[i:])
+            if m and m.group(0) not in ("{}", "{,}"):
+                out.append(m.group(0))
+                i += m.end()
+                lazy_after()
+            else:
+                out.append("\\{")
+                i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), warn, ok
+
+
+def regex_usage(src, case=False, word=False, dotall=False, repl=None):
+    """Morceaux prêts à copier : Python, Ansible (YAML + Jinja2) et grep."""
+    pattern = build_pattern(src, "regex", case, word, dotall)
+    _lead, body = split_global_flags(pattern.pattern)
+    names = [("IGNORECASE", re.IGNORECASE), ("MULTILINE", re.MULTILINE), ("DOTALL", re.DOTALL),
+             ("VERBOSE", re.VERBOSE), ("ASCII", re.ASCII)]
+    py_flags = " | ".join("re." + n for n, f in names if pattern.flags & f)
+    letters = "".join(l for l, f in (("i", re.IGNORECASE), ("m", re.MULTILINE), ("s", re.DOTALL),
+                                      ("x", re.VERBOSE), ("a", re.ASCII)) if pattern.flags & f)
+    inline = (f"(?{letters})" if letters else "") + body
+    tpl = npp_repl_template(repl) if repl is not None else None
+    out = ["# ---- Python " + "-" * 60,
+           "import re",
+           "",
+           f"motif = re.compile({_py_literal(body)}{', ' + py_flags if py_flags else ''})",
+           "premiere = motif.search(texte)        # 1re correspondance (ou None)",
+           "toutes = motif.findall(texte)         # toutes (les groupes, s'il y en a)",
+           "for m in motif.finditer(texte):       # une par une, avec m.group(1)…",
+           "    print(m.start(), m.group(0))"]
+    if tpl is not None:
+        out.append(f"nouveau = motif.sub({_py_literal(tpl)}, texte)")
+    jl = jinja_literal(inline)
+    out += ["",
+            "# ---- Ansible (filtres Jinja2) " + "-" * 43,
+            "# Forme conseillée : bloc YAML « >- », les antislashs ne sont doublés qu'une fois.",
+            "- name: Utiliser l'expression régulière",
+            "  ansible.builtin.set_fact:",
+            "    trouve: >-",
+            f"      {{{{ texte | regex_search({jl}) }}}}",
+            "    toutes: >-",
+            f"      {{{{ texte | regex_findall({jl}) }}}}"]
+    if pattern.groups:
+        out += ["    groupe_1: >-",
+                f"      {{{{ texte | regex_search({jl}, '\\\\1') }}}}"]
+    if tpl is not None:
+        out += ["    remplace: >-",
+                f"      {{{{ texte | regex_replace({jl}, {jinja_literal(tpl)}) }}}}"]
+    out += ["  when: >-",
+            f"    texte is search({jl})",
+            "",
+            "# Même chose sur une seule ligne entre guillemets doubles (antislashs doublés deux fois) :",
+            "    trouve: " + yaml_double(f"{{{{ texte | regex_search({jl}) }}}}")]
+    if tpl is not None:
+        out.append("    remplace: " + yaml_double(f"{{{{ texte | regex_replace({jl}, {jinja_literal(tpl)}) }}}}"))
+    lead, raw = split_global_flags(pcre_to_python(src))
+    ere, warns, ok = to_posix_ere(raw)
+    opts = "E" + ("" if case and "i" not in lead else "i") + ("w" if word else "")
+    out += ["", "# ---- grep (Terminal Mac ou Linux) " + "-" * 38]
+    if dotall:
+        warns.insert(0, "grep travaille ligne par ligne : l'option « . = retour à la ligne » ne s'applique pas")
+    for w in warns:
+        out.append("# ⚠ " + w)
+    if ok:
+        out += [f"grep -{opts}n {shell_quote(ere)} fichier.txt      # lignes qui correspondent, avec leur numéro",
+                f"grep -{opts}o {shell_quote(ere)} fichier.txt      # seulement les morceaux trouvés",
+                f"grep -{opts}rn {shell_quote(ere)} dossier/        # dans tout un dossier"]
+    else:
+        out.append("# Cette expression n'a pas d'équivalent pour grep -E : utilise plutôt Python ou Ansible.")
+    return "\n".join(out)
+
+
+# ---- bibliothèque d'expressions prêtes à l'emploi -------------------------------------------------
+
+_IPV4_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+_H4 = r"[0-9A-Fa-f]{1,4}"
+
+REGEX_LIBRARY = (
+    ("Réseau", (
+        ("Adresse IPv4", r"\b(?:" + _IPV4_OCTET + r"\.){3}" + _IPV4_OCTET + r"\b",
+         "Quatre nombres de 0 à 255 séparés par des points.",
+         "Serveur 192.168.1.20 joignable, 10.0.0.1 aussi.\nRefusé : 256.1.1.1 et 1.2.3"),
+        ("Adresse IPv4 avec masque (CIDR)",
+         r"\b(?:" + _IPV4_OCTET + r"\.){3}" + _IPV4_OCTET + r"/(?:3[0-2]|[12]?\d)\b",
+         "Une adresse IPv4 suivie de /0 à /32.",
+         "Réseaux autorisés : 10.0.0.0/8, 192.168.10.0/24\nRefusé : 10.0.0.0/33"),
+        ("Adresse IPv6",
+         r"(?<![\w:])(?:(?:" + _H4 + r":){7}" + _H4 + r"|(?:" + _H4 + r":){1,7}:|(?:" + _H4 + r":){1,6}:"
+         + _H4 + r"|(?:" + _H4 + r":){1,5}(?::" + _H4 + r"){1,2}|(?:" + _H4 + r":){1,4}(?::" + _H4
+         + r"){1,3}|(?:" + _H4 + r":){1,3}(?::" + _H4 + r"){1,4}|(?:" + _H4 + r":){1,2}(?::" + _H4
+         + r"){1,5}|" + _H4 + r":(?::" + _H4 + r"){1,6}|:(?:(?::" + _H4 + r"){1,7}|:))(?![\w:])",
+         "Forme complète ou abrégée avec « :: ».",
+         "2001:0db8:85a3:0000:0000:8a2e:0370:7334\nfe80::1 et ::1 et 2001:db8::8a2e:370:7334"),
+        ("Adresse MAC", r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b|\b(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b",
+         "Six paires hexadécimales séparées par « : » ou « - ».",
+         "eth0 : 00:1A:2b:3C:4d:5E\nwifi : AC-DE-48-00-11-22"),
+        ("Numéro de port (1 à 65535)",
+         r"\b(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3})\b",
+         "Un nombre entre 1 et 65535.", "ports: 22, 443, 8080, 65535\nhors plage : 65536"),
+        ("Hôte:port", r"\b([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):(\d{1,5})\b",
+         "Groupe 1 = hôte, groupe 2 = port.", "db01.prod.local:5432\nlocalhost:8080 et 10.1.2.3:22"),
+        ("Nom d'hôte complet (FQDN)",
+         r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}\b",
+         "Morceaux séparés par des points, terminés par un domaine en lettres.",
+         "srv-web-01.intra.exemple.fr\napi.exemple.com"),
+        ("URL http(s)", r"\bhttps?://[^\s\"'<>]+",
+         "Commence par http:// ou https:// et s'arrête au premier blanc ou guillemet.",
+         "Doc : https://docs.exemple.com/guide?page=2#haut\nhttp://intranet/outil"),
+        ("Adresse e-mail", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+         "Forme courante nom@domaine.ext (pas toutes les subtilités de la norme).",
+         "Contact : prenom.nom@exemple.fr, support+ops@exemple.com"),
+    )),
+    ("Dates et heures", (
+        ("Date ISO (AAAA-MM-JJ)", r"\b\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b",
+         "Mois de 01 à 12, jour de 01 à 31.", "Livraison le 2026-11-25, pas le 2026-13-01."),
+        ("Date française (JJ/MM/AAAA)", r"\b(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|1[0-2])/\d{4}\b",
+         "Jour/mois/année sur quatre chiffres.", "Réunion le 25/11/2026 (et non 32/01/2026)."),
+        ("Heure (HH:MM ou HH:MM:SS)", r"\b(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b",
+         "De 00:00 à 23:59, secondes facultatives.", "Début 08:30, fin 17:45:12, pas 24:00."),
+        ("Horodatage ISO 8601",
+         r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?(?!\w)",
+         "Date, heure, fractions de seconde et fuseau facultatifs.",
+         "2026-11-25T14:02:03Z\n2026-11-25 14:02:03.123+01:00"),
+        ("Date syslog (« Nov 25 14:02:03 »)",
+         r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2}\b",
+         "Format des journaux système Unix.", "Nov 25 14:02:03 srv01 sshd[812]: Accepted publickey"),
+    )),
+    ("Identifiants et sécurité", (
+        ("UUID", r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+         "Identifiant 8-4-4-4-12 en hexadécimal.", "job_id: 550e8400-e29b-41d4-a716-446655440000"),
+        ("Empreinte MD5 / SHA-1 / SHA-256", r"\b(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}|[0-9a-fA-F]{32})\b",
+         "32, 40 ou 64 caractères hexadécimaux.",
+         "md5 d41d8cd98f00b204e9800998ecf8427e\nsha1 da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+        ("Jeton JWT", r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*",
+         "Trois blocs Base64 URL séparés par des points.",
+         "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl"),
+        ("Bloc Base64 (16 caractères ou plus)",
+         r"(?<![A-Za-z0-9+/=])(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?(?![A-Za-z0-9+/=])",
+         "Suite de groupes de 4 caractères Base64, avec « = » final éventuel.",
+         "data: SGVsbG8gdG91dCBsZSBtb25kZSAh\ncourt : abc="),
+        ("Clé publique SSH",
+         r"\b(?:ssh-(?:rsa|ed25519|dss)|ecdsa-sha2-nistp(?:256|384|521)) [A-Za-z0-9+/]+=*(?: \S+)?",
+         "Type de clé, contenu Base64 et commentaire facultatif.",
+         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExempleExempleExemple user@mac"),
+        ("Bloc PEM (certificat, clé…)", r"-----BEGIN ([A-Z0-9 ]+)-----[\s\S]*?-----END \1-----",
+         "Du BEGIN au END correspondant (sur plusieurs lignes).",
+         "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----"),
+        ("Secret en clair (password: …)",
+         r"\b(?i:\w*(?:password|passwd|pwd|secret|token|api[_-]?key)\w*)\s*[:=]\s*\S+",
+         "Repère les mots de passe ou jetons écrits en clair avant un commit.",
+         "db_password: Sup3rS3cret\nAPI_KEY=abcd1234\nvault_password_file: ~/.vault"),
+    )),
+    ("Ansible, YAML, Jinja2", (
+        ("Variable Jinja {{ … }}", r"\{\{\s*(.*?)\s*\}\}", "Groupe 1 = l'expression entre les accolades.",
+         "dest: \"{{ app_dir }}/conf/{{ env | default('prod') }}.yml\""),
+        ("Bloc Jinja {% … %}", r"\{%-?\s*(\w+)(.*?)-?%\}", "Groupe 1 = mot-clé (if, for, set…).",
+         "{% for h in groups['web'] %}{{ h }}{% endfor %}"),
+        ("Clé YAML en début de ligne", r"^(\s*)(?:- )?([\w.-]+):(?=\s|$)",
+         "Groupe 1 = indentation, groupe 2 = nom de la clé.",
+         "- name: Installer nginx\n  ansible.builtin.package:\n    name: nginx\n    state: present"),
+        ("Nom de tâche (- name:)", r"^\s*- name:\s*(.*)$", "Groupe 1 = titre de la tâche.",
+         "- name: Copier la configuration\n  ansible.builtin.copy:\n    src: app.conf"),
+        ("Module FQCN (ansible.builtin.copy…)", r"^\s*(?:- )?([a-z0-9_]+\.[a-z0-9_]+\.[a-z0-9_]+):",
+         "Groupe 1 = nom complet du module.",
+         "- name: Redémarrer\n  ansible.builtin.service:\n    name: nginx\n  community.general.ufw:"),
+        ("Récapitulatif PLAY RECAP",
+         r"^(\S+)\s*:\s*ok=(\d+)\s+changed=(\d+)\s+unreachable=(\d+)\s+failed=(\d+)",
+         "Groupes : hôte, ok, changed, unreachable, failed.",
+         "srv01                      : ok=12   changed=3    unreachable=0    failed=0\n"
+         "srv02                      : ok=4    changed=0    unreachable=1    failed=2"),
+        ("Variable d'environnement ($VAR, ${VAR})", r"\$(?:\{(\w+)\}|(\w+))",
+         "Groupe 1 ou 2 = nom de la variable.", "export PATH=$HOME/bin:${PATH}"),
+    )),
+    ("Journaux (logs)", (
+        ("Ligne contenant ERROR, FATAL ou CRITICAL", r"^.*\b(?:ERROR|FATAL|CRITICAL)\b.*$",
+         "La ligne entière (à utiliser avec « Respecter la casse »).",
+         "2026-11-25 10:00:01 INFO démarrage\n2026-11-25 10:00:02 ERROR connexion refusée\n"
+         "2026-11-25 10:00:03 WARN lent"),
+        ("Niveau de log", r"\b(?:TRACE|DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|FATAL|CRITICAL)\b",
+         "Les niveaux usuels.", "[INFO] ok\n[WARNING] disque à 85 %\n[ERROR] échec"),
+        ("Requête HTTP dans un log d'accès",
+         r"\"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) (\S+) HTTP/[\d.]+\" (\d{3})",
+         "Groupes : méthode, chemin, code de retour.",
+         "10.0.0.5 - - [25/Nov/2026:10:00:00 +0100] \"GET /api/health HTTP/1.1\" 200 17\n"
+         "10.0.0.6 - - [25/Nov/2026:10:00:01 +0100] \"POST /login HTTP/1.1\" 401 0"),
+        ("Pile d'appels Java (« at … »)", r"^\s+at [\w.$<>]+\([^)]*\)$",
+         "Lignes d'une stack trace Java.",
+         "java.lang.NullPointerException\n    at com.exemple.App.run(App.java:42)\n"
+         "    at com.exemple.App.main(App.java:10)"),
+        ("Pile d'appels Python (fichier, ligne)", r"^\s*File \"([^\"]+)\", line (\d+)",
+         "Groupes : fichier, numéro de ligne.",
+         "Traceback (most recent call last):\n  File \"/opt/app/main.py\", line 12, in <module>"),
+    )),
+    ("Texte et code", (
+        ("Ligne vide (ou blancs seuls)", r"^[ \t]*$", "Pratique avec « Remplacer » pour nettoyer.",
+         "ligne 1\n\n   \nligne 4"),
+        ("Espaces en fin de ligne", r"[ \t]+$", "Remplacer par rien pour les supprimer.",
+         "texte avec espaces   \nautre ligne\t"),
+        ("Lignes en double qui se suivent", r"^(.*)(?:\r?\n\1)+$",
+         "Remplacer par $1 garde un seul exemplaire.", "alpha\nalpha\nbeta\ngamma\ngamma\ngamma"),
+        ("Nombre entier ou décimal", r"[-+]?\b\d+(?:[.,]\d+)?\b", "Accepte le point ou la virgule.",
+         "Total : 1250, remise -12,5 et taux 0.2"),
+        ("Texte entre guillemets doubles", r"\"((?:[^\"\\]|\\.)*)\"",
+         "Groupe 1 = contenu, guillemets échappés compris.", "msg = \"Bonjour \\\"toi\\\"\" + \"!\""),
+        ("Texte entre apostrophes", r"'((?:[^'\\]|\\.)*)'", "Groupe 1 = contenu.", "when: env == 'prod'"),
+        ("Commentaire # (shell, YAML, Python)", r"(?<!\S)#.*$", "Du # jusqu'à la fin de la ligne.",
+         "port: 8080   # port HTTP\n# ligne commentée\ncouleur: \"#FF0000\""),
+        ("Balise HTML / XML", r"<(/?)([A-Za-z][\w:.-]*)([^>]*)>",
+         "Groupes : / de fermeture, nom, attributs.", "<div class=\"note\"><b>Gras</b></div>"),
+        ("Chemin Unix / Mac", r"(?<![\w.~/])~?/[\w.@+/-]+", "Chemin absolu ou commençant par ~/.",
+         "Voir /etc/hosts et ~/mac/explorer/blocnotes.py"),
+        ("Chemin Windows", r"\b[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n]+\\)*[^\\/:*?\"<>|\r\n]*",
+         "Lettre de lecteur suivie de dossiers.", r"Copie vers C:\Users\moi\Documents\rapport.docx"),
+        ("Numéro de version (semver)",
+         r"\bv?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?\b",
+         "Groupes : majeure, mineure, correctif, pré-version, build.",
+         "ansible-core 2.16.3, outil v1.4.0-rc.1+build.7"),
+        ("Couleur hexadécimale", r"#(?:[0-9a-fA-F]{3}){1,2}\b", "#RGB ou #RRGGBB.",
+         "color: #0067C0; background: #fff;"),
+    )),
+    ("France", (
+        ("Téléphone français", r"(?<!\d)(?:\+33\s?|0)[1-9](?:[\s.-]?\d{2}){4}(?!\d)",
+         "06 12 34 56 78, 01.23.45.67.89 ou +33 6 12 34 56 78.",
+         "Tél. 06 12 34 56 78 / +33 1 23 45 67 89 / 0123456789"),
+        ("Code postal", r"\b(?:0[1-9]|[1-8]\d|9[0-8])\d{3}\b", "Cinq chiffres, département 01 à 98.",
+         "75001 Paris, 69002 Lyon, 13008 Marseille"),
+    )),
+)
 
 
 # ======================================================================================
@@ -837,10 +1724,10 @@ from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QFont, QFontDa
                            QPalette, QPen, QPixmap, QPolygonF, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextFormat, QTextOption)
 from PySide6.QtWidgets import (QApplication, QCheckBox,  # noqa: E402
                                QComboBox, QDialog, QDialogButtonBox, QDockWidget, QFileDialog,
-                               QFontComboBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+                               QFontComboBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
-                               QSpinBox, QSplitter, QStatusBar, QTabBar, QTabWidget, QTextEdit,
+                               QScrollArea, QSpinBox, QSplitter, QStatusBar, QTabBar, QTabWidget, QTextEdit,
                                QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 EOL_PROP = QTextFormat.Property.UserProperty.value + 1
@@ -1427,6 +2314,17 @@ def _(p, c):
     p.drawLine(QPointF(8.3, 8.3), QPointF(10.5, 10.5))
     p.drawLine(QPointF(9, 14), QPointF(15, 14))
     p.drawPolyline(QPolygonF([QPointF(13, 12), QPointF(15, 14), QPointF(13, 16)]))
+
+
+@_glyph("regex")
+def _(p, c):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(c)
+    p.drawRoundedRect(QRectF(1.6, 10.6, 3.6, 3.6), 0.7, 0.7)
+    _pen(p, c, 1.5)
+    cx, cy, r = 10.6, 5.8, 4.3
+    for dx, dy in ((0.0, 1.0), (0.866, 0.5), (-0.866, 0.5)):
+        p.drawLine(QPointF(cx - r * dx, cy - r * dy), QPointF(cx + r * dx, cy + r * dy))
 
 
 @_glyph("zoomin")
@@ -3183,6 +4081,16 @@ class FindDialog(QDialog):
         self.find_edit.setFocus()
         self.find_edit.lineEdit().selectAll()
 
+    def load(self, find, repl=None, case=False, word=False, dotall=False, mode="regex"):
+        """Préremplit le dialogue (utilisé par le testeur d'expressions régulières)."""
+        self.find_edit.setCurrentText(find)
+        if repl is not None:
+            self.repl_edit.setCurrentText(repl)
+        {"regex": self.m_regex, "extended": self.m_ext}.get(mode, self.m_normal).setChecked(True)
+        self.case.setChecked(case)
+        self.word.setChecked(word)
+        self.dotall.setChecked(dotall)
+
     def _tab_changed(self, index):
         show_repl = index in (1, 2)
         files = index == 2
@@ -3852,6 +4760,753 @@ class CompareWindow(QWidget):
 
 
 # ======================================================================================
+# Testeur et générateur d'expressions régulières
+# ======================================================================================
+
+REGEX_LIVE_LIMIT = 300_000      # au-delà, on ne teste plus à chaque frappe (bouton « Tester »)
+REGEX_MATCH_LIMIT = 10_000
+REGEX_ROW_LIMIT = 1_000
+REGEX_MATCH_COLORS = {False: ("#CFE6FF", "#D7F0CB"), True: ("#1F4A73", "#2E5228")}
+REGEX_GROUP_COLORS = {False: ("#FFD27F", "#F7B3CF", "#A6E3DC", "#D6C4FF", "#FFE69A", "#C3E2A4"),
+                      True: ("#7A5A10", "#7A2F4F", "#1F5F5A", "#4F3A7A", "#6B5A1A", "#3F5A2A")}
+REGEX_DEMO = ("2026-11-25 08:30:12 INFO  srv-web-01 démarrage du service nginx\n"
+              "2026-11-25 08:31:40 ERROR srv-db-02 connexion refusée vers 10.0.4.17:5432\n"
+              "2026-11-25 08:32:05 WARN  srv-web-01 disque /var à 85 %\n"
+              "- name: Installer nginx\n"
+              "  ansible.builtin.package:\n"
+              "    name: \"{{ paquet | default('nginx') }}\"\n")
+
+REGEX_BRICKS = (
+    ("Caractères", (
+        (".", ".", "", "", "N'importe quel caractère (sauf retour à la ligne)"),
+        (r"\d", r"\d", "", "", "Un chiffre (0 à 9)"),
+        (r"\w", r"\w", "", "", "Une lettre, un chiffre ou _"),
+        (r"\s", r"\s", "", "", "Un blanc : espace, tabulation…"),
+        (r"\D", r"\D", "", "", "Tout sauf un chiffre"),
+        (r"\W", r"\W", "", "", "Tout sauf lettre, chiffre ou _"),
+        (r"\S", r"\S", "", "", "Tout sauf un blanc"),
+        ("[abc]", "[", "]", "abc", "Un caractère parmi ceux listés"),
+        ("[^abc]", "[^", "]", "abc", "Un caractère sauf ceux listés"),
+        ("[a-z]", "[", "]", "a-z", "Un caractère compris dans l'intervalle"),
+        (r"\.", r"\.", "", "", "Un vrai point (les caractères spéciaux . * + ? ( ) [ ] { } | ^ $ \\ "
+                                "se protègent avec \\)"),
+        (r"\t", r"\t", "", "", "Une tabulation"),
+    )),
+    ("Position", (
+        ("^", "^", "", "", "Début de ligne"),
+        ("$", "$", "", "", "Fin de ligne"),
+        (r"\b", r"\b", "", "", "Limite de mot (avant ou après un mot)"),
+        (r"\A", r"\A", "", "", "Tout début du texte"),
+        (r"\Z", r"\Z", "", "", "Toute fin du texte"),
+    )),
+    ("Répétition", (
+        ("*", "*", "", "", "0 fois ou plus"),
+        ("+", "+", "", "", "1 fois ou plus"),
+        ("?", "?", "", "", "Facultatif (0 ou 1 fois)"),
+        ("{n}", "{", "}", "3", "Exactement n fois"),
+        ("{n,m}", "{", "}", "2,5", "Entre n et m fois"),
+        ("{n,}", "{", ",}", "2", "Au moins n fois"),
+        ("*?", "*?", "", "", "0 fois ou plus, le moins possible"),
+        ("+?", "+?", "", "", "1 fois ou plus, le moins possible"),
+    )),
+    ("Groupes", (
+        ("( … )", "(", ")", "", "Groupe capturé : réutilisable avec $1, $2…"),
+        ("(?: … )", "(?:", ")", "", "Groupe non capturé (juste pour regrouper)"),
+        ("(?P<nom> … )", "(?P<nom>", ")", "", "Groupe nommé : réutilisable avec ${nom}"),
+        ("|", "|", "", "", "Ou (l'un ou l'autre)"),
+        (r"\1", r"\1", "", "", "Le même texte que celui du groupe 1"),
+        ("(?= … )", "(?=", ")", "", "Suivi de… (sans le prendre)"),
+        ("(?! … )", "(?!", ")", "", "Non suivi de…"),
+        ("(?<= … )", "(?<=", ")", "", "Précédé de… (longueur fixe)"),
+        ("(?<! … )", "(?<!", ")", "", "Non précédé de… (longueur fixe)"),
+    )),
+)
+
+
+def _fold(text):
+    """Minuscules sans accents, pour filtrer la bibliothèque."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(c))
+
+
+def _shown(text, limit=200):
+    if text == "":
+        return "(vide)"
+    text = text.replace("\n", "⏎").replace("\t", "⇥")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _html(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+class RegexDialog(QDialog):
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("Testeur et générateur d'expressions régulières")
+        self.setModal(False)
+        self.resize(1180, 790)
+        self.pattern = None
+        self.spans = []
+        self.mono = editor_font(pref("font_size"))
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(220)
+        self.timer.timeout.connect(self.run)
+        root = QVBoxLayout(self)
+
+        top = QGridLayout()
+        self.expr = self._history_combo("history_regex")
+        self.expr.lineEdit().setPlaceholderText("Tape ton expression, ou prends-en une dans la bibliothèque à gauche…")
+        self.test_btn = QPushButton("Tester")
+        self.test_btn.clicked.connect(self.run)
+        copy = QPushButton("Copier")
+        copy.setToolTip("Copier l'expression")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(self.expr.currentText()))
+        top.addWidget(QLabel("Expression :"), 0, 0)
+        top.addWidget(self.expr, 0, 1)
+        top.addWidget(self.test_btn, 0, 2)
+        top.addWidget(copy, 0, 3)
+        opts = QHBoxLayout()
+        self.case = QCheckBox("Respecter la casse")
+        self.word = QCheckBox("Mot entier uniquement")
+        self.dotall = QCheckBox(". correspond aussi aux retours à la ligne")
+        for w in (self.case, self.word, self.dotall):
+            opts.addWidget(w)
+            w.toggled.connect(self.schedule)
+        opts.addStretch(1)
+        top.addLayout(opts, 1, 1, 1, 3)
+        top.setColumnStretch(1, 1)
+        root.addLayout(top)
+        self.status = QLabel(" ")
+        self.status.setWordWrap(True)
+        root.addWidget(self.status)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(split, 1)
+        split.addWidget(self._build_generator())
+        right = QSplitter(Qt.Orientation.Vertical)
+        split.addWidget(right)
+
+        test_box = QWidget()
+        tl = QVBoxLayout(test_box)
+        tl.setContentsMargins(0, 0, 0, 0)
+        head = QHBoxLayout()
+        head.addWidget(QLabel("Texte à tester :"))
+        head.addStretch(1)
+        for text, fn in (("Prendre la sélection", self.take_selection), ("Prendre tout le document", self.take_document),
+                         ("Vider", lambda: self.set_test(""))):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            head.addWidget(b)
+        tl.addLayout(head)
+        self.test = self._text_area(read_only=False)
+        self.test.textChanged.connect(self.schedule)
+        tl.addWidget(self.test)
+        right.addWidget(test_box)
+
+        self.tabs = QTabWidget()
+        self.table = QTreeWidget()
+        self.table.setRootIsDecorated(False)
+        self.table.setUniformRowHeights(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.itemSelectionChanged.connect(self._row_selected)
+        self.tabs.addTab(self.table, "Correspondances")
+        repl_box = QWidget()
+        rl = QVBoxLayout(repl_box)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Remplacer par :"))
+        self.repl = self._history_combo("history_regex_repl")
+        row.addWidget(self.repl, 1)
+        rl.addLayout(row)
+        hint = QLabel("$1, ${1} ou \\1 : groupe 1   ·   ${nom} : groupe nommé   ·   $& ou $0 : tout le texte "
+                      "trouvé   ·   \\$ : un vrai $   ·   \\n, \\t : retour à la ligne, tabulation")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #808080;")
+        rl.addWidget(hint)
+        self.repl_status = QLabel(" ")
+        rl.addWidget(self.repl_status)
+        self.preview = self._text_area()
+        rl.addWidget(self.preview)
+        self.tabs.addTab(repl_box, "Remplacement")
+        self.explain = self._text_area(wrap=True)
+        self.tabs.addTab(self.explain, "Explication")
+        usage_box = QWidget()
+        ul = QVBoxLayout(usage_box)
+        self.usage = self._text_area()
+        ul.addWidget(self.usage)
+        urow = QHBoxLayout()
+        note = QLabel("Prêt à copier : les antislashs sont déjà doublés là où il le faut (YAML, Jinja2, shell).")
+        note.setStyleSheet("color: #808080;")
+        urow.addWidget(note, 1)
+        ucopy = QPushButton("Tout copier")
+        ucopy.clicked.connect(lambda: QApplication.clipboard().setText(self.usage.toPlainText()))
+        urow.addWidget(ucopy)
+        ul.addLayout(urow)
+        self.tabs.addTab(usage_box, "Python · Ansible · grep")
+        right.addWidget(self.tabs)
+        right.setSizes([340, 320])
+        split.setSizes([380, 800])
+        split.setStretchFactor(1, 1)
+
+        bottom = QHBoxLayout()
+        for text, tab, tip in (("Rechercher dans le document", 0, "Ouvre « Rechercher » avec cette expression"),
+                               ("Remplacer dans le document…", 1, "Ouvre « Remplacer » : rien n'est modifié tant "
+                                                                 "que tu ne cliques pas sur Remplacer"),
+                               ("Marquer dans le document", 3, "Surligne toutes les correspondances du document")):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _c=False, t=tab: self.send(t))
+            bottom.addWidget(b)
+        bottom.addStretch(1)
+        close = QPushButton("Fermer")
+        close.clicked.connect(self.hide)
+        bottom.addWidget(close)
+        root.addLayout(bottom)
+
+        for b in self.findChildren(QPushButton):     # Entrée ne doit jamais déclencher un autre bouton
+            b.setAutoDefault(False)
+        self.test_btn.setDefault(True)
+        self.expr.editTextChanged.connect(self.schedule)
+        self.repl.editTextChanged.connect(self.schedule)
+        self._restore()
+        self._fill_library()
+
+    # ------------------------------------------------------------------ construction
+    def _history_combo(self, key):
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setMinimumWidth(320)
+        combo.setFont(self.mono)
+        # la feuille de style de l'application écrase setFont() sur les listes déroulantes : on la précise ici
+        combo.setStyleSheet(f'font-family: "{self.mono.family()}"; font-size: {self.mono.pointSizeF():g}pt;')
+        hist = conf().value(key, [])
+        if isinstance(hist, str):
+            hist = [hist]
+        combo.addItems([h for h in (hist or []) if isinstance(h, str)])
+        combo.setCurrentText("")
+        return combo
+
+    def _remember(self, combo, key):
+        text = combo.currentText()
+        if not text:
+            return
+        hist = [text] + [combo.itemText(i) for i in range(combo.count()) if combo.itemText(i) != text][:29]
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(hist)
+        combo.setCurrentText(text)
+        combo.blockSignals(False)
+        conf().setValue(key, hist)
+
+    def _text_area(self, read_only=True, wrap=False):
+        area = QPlainTextEdit()
+        area.setFont(self.mono)
+        area.setReadOnly(read_only)
+        area.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth if wrap else QPlainTextEdit.LineWrapMode.NoWrap)
+        area.setTabStopDistance(QFontMetricsF(self.mono).horizontalAdvance(" ") * 4)
+        return area
+
+    def _build_generator(self):
+        tabs = QTabWidget()
+        self.gen_tabs = tabs
+        # -- bibliothèque
+        lib = QWidget()
+        ll = QVBoxLayout(lib)
+        self.lib_filter = QLineEdit()
+        self.lib_filter.setPlaceholderText("Filtrer : ip, date, yaml, log…")
+        self.lib_filter.setClearButtonEnabled(True)
+        self.lib_filter.textChanged.connect(self._fill_library)
+        ll.addWidget(self.lib_filter)
+        self.lib_tree = QTreeWidget()
+        self.lib_tree.setHeaderHidden(True)
+        self.lib_tree.itemSelectionChanged.connect(self._lib_selected)
+        self.lib_tree.itemDoubleClicked.connect(lambda item, _c: self.use_library() if item.parent() else None)
+        ll.addWidget(self.lib_tree, 1)
+        self.lib_desc = QLabel(" ")
+        self.lib_desc.setWordWrap(True)
+        ll.addWidget(self.lib_desc)
+        self.lib_regex = QPlainTextEdit()
+        self.lib_regex.setReadOnly(True)
+        self.lib_regex.setFont(self.mono)
+        self.lib_regex.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.lib_regex.setMaximumHeight(76)
+        ll.addWidget(self.lib_regex)
+        r1 = QHBoxLayout()
+        use = QPushButton("Utiliser")
+        use.setToolTip("Met l'expression dans le champ du haut (double-clic aussi)")
+        use.clicked.connect(lambda: self.use_library())
+        sample = QPushButton("Utiliser avec son exemple")
+        sample.setToolTip("Met aussi un texte d'exemple dans la zone de test")
+        sample.clicked.connect(lambda: self.use_library(with_sample=True))
+        r1.addWidget(use)
+        r1.addWidget(sample)
+        ll.addLayout(r1)
+        r2 = QHBoxLayout()
+        save = QPushButton("Garder l'expression actuelle…")
+        save.setToolTip("L'ajoute à « Mes expressions »")
+        save.clicked.connect(self.save_custom)
+        self.lib_delete = QPushButton("Retirer")
+        self.lib_delete.setToolTip("Retire une de « Mes expressions » (demande confirmation)")
+        self.lib_delete.clicked.connect(self.delete_custom)
+        self.lib_delete.setEnabled(False)
+        r2.addWidget(save)
+        r2.addWidget(self.lib_delete)
+        ll.addLayout(r2)
+        tabs.addTab(lib, "Bibliothèque")
+        # -- à partir d'exemples
+        gen = QWidget()
+        gl = QVBoxLayout(gen)
+        lab = QLabel("Colle un ou plusieurs exemples de ce que tu veux reconnaître, <b>un par ligne</b> :")
+        lab.setWordWrap(True)
+        gl.addWidget(lab)
+        self.examples = self._text_area(read_only=False)
+        gl.addWidget(self.examples, 1)
+        take = QPushButton("Prendre la sélection du document")
+        take.clicked.connect(self.take_examples)
+        gl.addWidget(take)
+        self.g_same = QCheckBox("Garder tel quel ce qui est identique partout")
+        self.g_same.setChecked(True)
+        self.g_same.setToolTip("Avec au moins deux exemples : un mot présent partout (sshd, ERROR…) reste écrit en clair")
+        self.g_words = QCheckBox("Garder les mots tels quels (ERROR|WARN…)")
+        self.g_flex = QCheckBox("Longueurs souples (\\d+) plutôt qu'exactes (\\d{4})")
+        self.g_anchor = QCheckBox("Ligne entière (^ … $)")
+        self.g_capture = QCheckBox("Capturer chaque partie variable ($1, $2…)")
+        for w in (self.g_same, self.g_words, self.g_flex, self.g_anchor, self.g_capture):
+            gl.addWidget(w)
+        go = QPushButton("Générer l'expression")
+        go.clicked.connect(self.generate)
+        gl.addWidget(go)
+        self.g_info = QLabel(" ")
+        self.g_info.setWordWrap(True)
+        gl.addWidget(self.g_info)
+        tabs.addTab(gen, "À partir d'exemples")
+        # -- briques
+        bricks = QWidget()
+        bl = QVBoxLayout(bricks)
+        intro = QLabel("Clique pour insérer à l'endroit du curseur. Si du texte est sélectionné dans l'expression, "
+                       "les groupes l'entourent.")
+        intro.setWordWrap(True)
+        bl.addWidget(intro)
+        for title, items in REGEX_BRICKS:
+            box = QGroupBox(title)
+            grid = QGridLayout(box)
+            grid.setSpacing(4)
+            for k, (label, before, after, inner, tip) in enumerate(items):
+                b = QPushButton(label)
+                b.setFont(self.mono)
+                b.setToolTip(tip)
+                b.clicked.connect(lambda _c=False, bf=before, af=after, inn=inner: self.insert_brick(bf, af, inn))
+                grid.addWidget(b, k // 3, k % 3)
+            bl.addWidget(box)
+        bl.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(bricks)
+        tabs.addTab(scroll, "Briques")
+        tabs.setMinimumWidth(330)
+        return tabs
+
+    # ------------------------------------------------------------------ état
+    def _restore(self):
+        c = conf()
+        self.expr.setCurrentText(str(c.value("regex_expr", "") or ""))
+        self.repl.setCurrentText(str(c.value("regex_repl", "") or ""))
+        opts = str(c.value("regex_opts", "") or "")
+        self.case.setChecked("c" in opts)
+        self.word.setChecked("w" in opts)
+        self.dotall.setChecked("s" in opts)
+        test = c.value("regex_test", None)
+        self.test.setPlainText(REGEX_DEMO if test is None else str(test))
+        self.examples.setPlainText(str(c.value("regex_examples", "") or ""))
+
+    def save_state(self):
+        c = conf()
+        c.setValue("regex_expr", self.expr.currentText())
+        c.setValue("regex_repl", self.repl.currentText())
+        c.setValue("regex_opts", ("c" if self.case.isChecked() else "") + ("w" if self.word.isChecked() else "")
+                   + ("s" if self.dotall.isChecked() else ""))
+        c.setValue("regex_test", self.test_text()[:100_000])
+        c.setValue("regex_examples", self.examples.toPlainText()[:20_000])
+        if self.pattern is not None:
+            self._remember(self.expr, "history_regex")
+
+    def hideEvent(self, event):
+        self.save_state()
+        super().hideEvent(event)
+
+    def present(self, selection=""):
+        if selection:
+            self.set_test(selection)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.expr.setFocus()
+        self.run()
+
+    # ------------------------------------------------------------------ texte à tester
+    def test_text(self):
+        return self.test.document().toRawText().replace(" ", "\n").replace(" ", "\n")
+
+    def set_test(self, text):
+        cur = self.test.textCursor()
+        cur.select(QTextCursor.SelectionType.Document)
+        cur.insertText(text)            # garde l'annulation (Cmd+Z) possible
+
+    def _selection(self):
+        ed = self.win.current()
+        if ed is None or not ed.textCursor().hasSelection():
+            return ""
+        return ed.textCursor().selection().toRawText().replace(" ", "\n")
+
+    def take_selection(self):
+        sel = self._selection()
+        if sel:
+            self.set_test(sel)
+        else:
+            self._say("Rien n'est sélectionné dans le document.", "warn")
+
+    def take_document(self):
+        ed = self.win.current()
+        if ed is not None:
+            self.set_test(ed.text())
+
+    def take_examples(self):
+        sel = self._selection()
+        if sel:
+            self.examples.setPlainText(sel)
+        else:
+            self.g_info.setText("Sélectionne d'abord une ou plusieurs lignes dans le document.")
+
+    # ------------------------------------------------------------------ test
+    def schedule(self, *_args):
+        if self.test.document().characterCount() > REGEX_LIVE_LIMIT:
+            self.timer.stop()
+            self._say("Texte long : clique sur « Tester » (ou Entrée) pour lancer la recherche.", "warn")
+            return
+        self.timer.start()
+
+    def _say(self, text, kind=""):
+        color = {"error": "#C42B1C", "ok": "#0F7B0F", "warn": "#C86400"}.get(kind, "")
+        self.status.setStyleSheet(f"color: {color};" if color else "")
+        self.status.setText(text)
+
+    def options(self):
+        return self.case.isChecked(), self.word.isChecked(), self.dotall.isChecked()
+
+    def run(self):
+        self.timer.stop()
+        src = self.expr.currentText()
+        text = self.test_text()
+        self.pattern, self.spans = None, []
+        if not src:
+            self._say("Tape une expression, choisis-en une dans la bibliothèque ou génère-la depuis des exemples.")
+            self._clear()
+            return
+        try:
+            pat = build_pattern(src, "regex", *self.options())
+        except ValueError as exc:
+            msg = str(exc).replace("expression régulière invalide : ", "")
+            pos = getattr(exc, "pos", None)
+            where = ""
+            if isinstance(pos, int) and 0 <= pos <= len(src):
+                where = "\n" + src + "\n" + " " * pos + "▲"
+                self.status.setFont(self.mono)
+            self._say("✗ " + msg[:1].upper() + msg[1:] + where, "error")
+            self._clear()
+            return
+        self.status.setFont(self.font())
+        self.pattern = pat
+        start = time.perf_counter()
+        truncated = False
+        for m in pat.finditer(text):
+            self.spans.append((m.start(), m.end(), [m.span(g) for g in range(1, pat.groups + 1)]))
+            if len(self.spans) >= REGEX_MATCH_LIMIT:
+                truncated = True
+                break
+        elapsed = (time.perf_counter() - start) * 1000
+        self._highlight(text)
+        self._fill_table(text)
+        warnings = self._refresh_side(text)
+        n = len(self.spans)
+        if n:
+            msg = f"✓ {n} correspondance{'s' if n > 1 else ''}" + (" (on s'arrête aux 10 000 premières)" if truncated
+                                                                   else "")
+        else:
+            msg = "Aucune correspondance dans le texte à tester"
+        msg += f"   ·   {pat.groups} groupe{'s' if pat.groups > 1 else ''}   ·   {elapsed:.1f} ms"
+        if warnings:
+            msg += "\n⚠ " + "\n⚠ ".join(warnings)
+        self._say(msg, "ok" if n and not warnings else "warn")
+
+    def _clear(self):
+        self.test.setExtraSelections([])
+        self.table.clear()
+        self.table.setHeaderLabels(["N°", "Ligne", "Col.", "Texte trouvé"])
+        self.preview.setPlainText("")
+        self.repl_status.setText(" ")
+        self.explain.setPlainText("")
+        self.usage.setPlainText("")
+
+    def _selection_at(self, doc, a, b, color):
+        sel = QTextEdit.ExtraSelection()
+        cur = QTextCursor(doc)
+        cur.setPosition(a)
+        cur.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+        sel.cursor = cur
+        sel.format.setBackground(QColor(color))
+        return sel
+
+    def _highlight(self, text):
+        pm = PosMap(text)
+        doc = self.test.document()
+        mc, gc = REGEX_MATCH_COLORS[Theme.dark], REGEX_GROUP_COLORS[Theme.dark]
+        sels = []
+        for k, (s, e, groups) in enumerate(self.spans):
+            if e > s:
+                sels.append(self._selection_at(doc, pm.to_doc(s), pm.to_doc(e), mc[k % 2]))
+            for g, (gs, ge) in enumerate(groups):
+                if gs >= 0 and ge > gs:
+                    sels.append(self._selection_at(doc, pm.to_doc(gs), pm.to_doc(ge), gc[g % len(gc)]))
+        self.test.setExtraSelections(sels)
+
+    def _fill_table(self, text):
+        pat = self.pattern
+        names = {v: k for k, v in pat.groupindex.items()}
+        headers = ["N°", "Ligne", "Col.", "Texte trouvé"] + [
+            f"{g} « {names[g]} »" if g in names else f"Groupe {g}" for g in range(1, pat.groups + 1)]
+        self.table.clear()
+        self.table.setColumnCount(len(headers))
+        self.table.setHeaderLabels(headers)
+        newlines = [m.start() for m in re.finditer("\n", text)]
+        gc = REGEX_GROUP_COLORS[Theme.dark]
+        items = []
+        for k, (s, e, groups) in enumerate(self.spans[:REGEX_ROW_LIMIT], 1):
+            line = bisect_left(newlines, s)
+            col = s - (newlines[line - 1] + 1 if line else 0)
+            cells = [str(k), str(line + 1), str(col + 1), _shown(text[s:e])]
+            cells += [_shown(text[gs:ge]) if gs >= 0 else "—" for gs, ge in groups]
+            item = QTreeWidgetItem(cells)
+            item.setData(0, Qt.ItemDataRole.UserRole, (s, e))
+            for g in range(len(groups)):
+                item.setBackground(4 + g, QBrush(QColor(gc[g % len(gc)])))
+            items.append(item)
+        self.table.addTopLevelItems(items)
+        for c in range(len(headers)):
+            self.table.resizeColumnToContents(c)
+            self.table.setColumnWidth(c, min(self.table.columnWidth(c), 360))
+        if len(self.spans) > REGEX_ROW_LIMIT:
+            more = QTreeWidgetItem(["…", "", "", f"(+ {len(self.spans) - REGEX_ROW_LIMIT} autres, non affichées)"])
+            self.table.addTopLevelItem(more)
+
+    def _row_selected(self):
+        items = self.table.selectedItems()
+        data = items[0].data(0, Qt.ItemDataRole.UserRole) if items else None
+        if not data:
+            return
+        s, e = data
+        pm = PosMap(self.test_text())
+        cur = self.test.textCursor()
+        cur.setPosition(pm.to_doc(s))
+        cur.setPosition(pm.to_doc(e), QTextCursor.MoveMode.KeepAnchor)
+        self.test.setTextCursor(cur)
+        self.test.ensureCursorVisible()
+
+    def _refresh_side(self, text):
+        pat = self.pattern
+        repl = self.repl.currentText()
+        # aperçu du remplacement
+        fn = make_replacer(repl, "regex")
+        out, marks, last, pos, count = [], [], 0, 0, 0
+        try:
+            for m in pat.finditer(text):
+                piece = fn(m)
+                out.append(text[last:m.start()])
+                pos += m.start() - last
+                out.append(piece)
+                marks.append((pos, pos + len(piece)))
+                pos += len(piece)
+                last = m.end()
+                count += 1
+                if count >= REGEX_MATCH_LIMIT:
+                    break
+            out.append(text[last:])
+            result = "".join(out)
+            self.preview.setPlainText(result)
+            pm = PosMap(result)
+            color = REGEX_MATCH_COLORS[Theme.dark][1]
+            self.preview.setExtraSelections([self._selection_at(self.preview.document(), pm.to_doc(a), pm.to_doc(b),
+                                                                color) for a, b in marks if b > a][:REGEX_MATCH_LIMIT])
+            self.repl_status.setStyleSheet("")
+            self.repl_status.setText(f"{count} remplacement{'s' if count > 1 else ''} (aperçu : le document "
+                                     "n'est pas modifié)")
+        except (re.error, IndexError) as exc:
+            msg = french_re_error(exc)[0] if isinstance(exc, re.error) else "groupe inexistant"
+            self.preview.setPlainText("")
+            self.repl_status.setStyleSheet("color: #C42B1C;")
+            self.repl_status.setText(f"✗ Remplacement impossible : {msg}")
+        # explication
+        explanation, warnings = explain_regex(pat)
+        self.explain.setPlainText(explanation)
+        # utilisation
+        try:
+            self.usage.setPlainText(regex_usage(self.expr.currentText(), *self.options(), repl=repl or None))
+        except ValueError as exc:
+            self.usage.setPlainText(str(exc))
+        return warnings
+
+    # ------------------------------------------------------------------ vers Rechercher / Remplacer / Marquer
+    def send(self, tab):
+        if self.pattern is None:
+            self.run()
+            if self.pattern is None:
+                return
+        self.save_state()
+        if self.repl.currentText():
+            self._remember(self.repl, "history_regex_repl")
+        self.win.regex_to_find(tab, self.expr.currentText(), self.repl.currentText(), *self.options())
+
+    # ------------------------------------------------------------------ briques
+    def insert_brick(self, before, after, inner):
+        le = self.expr.lineEdit()
+        selected = le.selectedText()
+        start = le.selectionStart() if le.hasSelectedText() else le.cursorPosition()
+        le.insert(before + (selected or inner) + after)
+        if not selected and inner:
+            le.setSelection(start + len(before), len(inner))
+        elif not selected and after:
+            le.setCursorPosition(start + len(before))
+        self.expr.setFocus()
+
+    # ------------------------------------------------------------------ bibliothèque
+    def _custom(self):
+        raw = conf().value("regex_custom", "")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) and raw else []
+        except ValueError:
+            data = []
+        return [d for d in data if isinstance(d, dict) and isinstance(d.get("regex"), str)]
+
+    def _fill_library(self, *_args, select=None):
+        needle = _fold(self.lib_filter.text().strip())
+        self.lib_tree.clear()
+        cats = []
+        custom = self._custom()
+        if custom:
+            cats.append(("Mes expressions", [(d.get("name") or d["regex"], d["regex"], d.get("description", ""),
+                                              d.get("sample", ""), True) for d in custom]))
+        cats += [(cat, [(n, r, d, s, False) for n, r, d, s in items]) for cat, items in REGEX_LIBRARY]
+        bold = QFont(self.font())
+        bold.setBold(True)
+        for cat, items in cats:
+            top = None
+            for name, regex, desc, sample, mine in items:
+                if needle and needle not in _fold(f"{cat} {name} {desc}"):
+                    continue
+                if top is None:
+                    top = QTreeWidgetItem([cat])
+                    top.setFont(0, bold)
+                    top.setFlags(top.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                    self.lib_tree.addTopLevelItem(top)
+                child = QTreeWidgetItem([name])
+                child.setToolTip(0, desc)
+                child.setData(0, Qt.ItemDataRole.UserRole, (name, regex, desc, sample, mine))
+                top.addChild(child)
+                if select is not None and mine and regex == select:
+                    self.lib_tree.setCurrentItem(child)
+            if top is not None:
+                top.setExpanded(True)
+
+    def _lib_data(self):
+        item = self.lib_tree.currentItem()
+        return item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+
+    def _lib_selected(self):
+        data = self._lib_data()
+        self.lib_delete.setEnabled(bool(data and data[4]))
+        if not data:
+            self.lib_desc.setText(" ")
+            self.lib_regex.setPlainText("")
+            return
+        name, regex, desc, _sample, _mine = data
+        self.lib_desc.setText(f"<b>{_html(name)}</b><br>{_html(desc)}")
+        self.lib_regex.setPlainText(regex)
+
+    def use_library(self, with_sample=False):
+        data = self._lib_data()
+        if not data:
+            return
+        _name, regex, _desc, sample, _mine = data
+        self.expr.setCurrentText(regex)
+        if sample and (with_sample or not self.test_text().strip()):
+            self.set_test(sample)
+        self.run()
+
+    def save_custom(self):
+        regex = self.expr.currentText()
+        if not regex or self.pattern is None:
+            self._say("Il faut d'abord une expression valide dans le champ du haut.", "warn")
+            return
+        name, ok = QInputDialog.getText(self, "Mes expressions", "Nom de l'expression :")
+        if not ok or not name.strip():
+            return
+        custom = [d for d in self._custom() if d["regex"] != regex]
+        sample = self.test_text()
+        custom.insert(0, {"name": name.strip(), "regex": regex, "description": "Ajoutée par toi.",
+                          "sample": sample if len(sample) <= 4000 else ""})
+        conf().setValue("regex_custom", json.dumps(custom, ensure_ascii=False))
+        self.lib_filter.clear()
+        self._fill_library(select=regex)
+        self.gen_tabs.setCurrentIndex(0)
+
+    def delete_custom(self):
+        data = self._lib_data()
+        if not data or not data[4]:
+            return
+        name, regex = data[0], data[1]
+        answer = QMessageBox.question(self, "Mes expressions", f"Retirer « {name} » de tes expressions ?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        conf().setValue("regex_custom", json.dumps([d for d in self._custom() if d["regex"] != regex],
+                                                   ensure_ascii=False))
+        self._fill_library()
+
+    # ------------------------------------------------------------------ générateur
+    def generate_from(self, text):
+        self.gen_tabs.setCurrentIndex(1)
+        self.examples.setPlainText(text)
+        self.generate()
+
+    def generate(self):
+        lines = self.examples.toPlainText().split("\n")
+        try:
+            regex, info = regex_from_examples(lines, self.g_same.isChecked(), self.g_words.isChecked(),
+                                              self.g_flex.isChecked(), self.g_anchor.isChecked(),
+                                              self.g_capture.isChecked())
+        except ValueError as exc:
+            self.g_info.setStyleSheet("color: #C42B1C;")
+            self.g_info.setText(str(exc).capitalize() + ".")
+            return
+        samples = [l.rstrip("\r") for l in lines if l.strip()]
+        try:
+            pat = build_pattern(regex, "regex", *self.options())
+            found = sum(1 for s in samples if pat.search(s))
+        except ValueError:
+            found = 0
+        self.expr.setCurrentText(regex)
+        if not self.test_text().strip():
+            self.set_test("\n".join(samples))
+        ok = found == len(samples)
+        self.g_info.setStyleSheet("color: #0F7B0F;" if ok else "color: #C86400;")
+        self.g_info.setText(info + f"\n{'✓' if ok else '⚠'} {found}/{len(samples)} exemple"
+                            f"{'s' if len(samples) > 1 else ''} reconnu{'s' if found > 1 else ''}. "
+                            "Vérifie ensuite sur ton vrai texte, à droite.")
+        self.run()
+
+
+# ======================================================================================
 # La fenêtre principale
 # ======================================================================================
 
@@ -3897,6 +5552,37 @@ QPushButton:default {{ border: 1px solid {c['accent']}; }}
 QGroupBox {{ border: 1px solid {c['border']}; border-radius: 6px; margin-top: 10px; padding-top: 6px; color: {c['text']}; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; }}
 QCheckBox, QRadioButton, QLabel {{ color: {c['text']}; }}
+""" + (dark_indicators_css(c) if Theme.dark else "")
+
+
+def check_mark_image():
+    """Petite coche des cases à cocher en thème sombre (créée dans le dossier privé)."""
+    path = os.path.join(data_dir("theme"), "coche.png")
+    if not os.path.isfile(path):
+        pm = QPixmap(28, 28)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#000000"))
+        pen.setWidthF(3.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPolyline(QPolygonF([QPointF(6, 14.5), QPointF(11.5, 20), QPointF(22, 8.5)]))
+        p.end()
+        pm.save(path, "PNG")
+    return path.replace("\\", "/")
+
+
+def dark_indicators_css(c):
+    """En sombre, les cases à cocher et boutons radio de Fusion sont presque invisibles : on les dessine."""
+    return f"""
+QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid #9A9A9A; border-radius: 4px; background: {c['field']}; }}
+QCheckBox::indicator:hover {{ border-color: #CFCFCF; }}
+QCheckBox::indicator:checked {{ background: {c['accent']}; border-color: {c['accent']}; image: url("{check_mark_image()}"); }}
+QCheckBox::indicator:disabled {{ border-color: #5A5A5A; }}
+QRadioButton::indicator {{ width: 14px; height: 14px; border: 1px solid #9A9A9A; border-radius: 8px; background: {c['field']}; }}
+QRadioButton::indicator:checked {{ border: 4px solid {c['accent']}; width: 8px; height: 8px; background: #000000; }}
 """
 
 
@@ -3936,6 +5622,7 @@ class MainWindow(QMainWindow):
         self.zoom_delta = 0
         self.compare_windows = []
         self.find_dialog = None
+        self.regex_dialog = None
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.setTabsClosable(True)
@@ -4097,6 +5784,8 @@ class MainWindow(QMainWindow):
         a["goto"] = A("Aller à la ligne…", E(self.goto), sc("Ctrl+G"))
         a["brace"] = A("Aller à l'accolade correspondante", E(self.goto_brace), sc("Ctrl+B"))
         a["filter"] = A("Filtrer les lignes…", E(self.filter_lines))
+        a["regex"] = A("Testeur et générateur de regex…", self.open_regex, sc("Ctrl+R"), icon="regex")
+        a["regexgen"] = A("Générer une regex depuis la sélection", E(self.regex_from_selection))
         a["clearmarks"] = A("Effacer toutes les marques", E(lambda ed: ed.clear_marks()))
         a["bm"] = A("Basculer le marque-page", E(lambda ed: ed.toggle_bookmark()), sc("Ctrl+F2"))
         a["bmnext"] = A("Marque-page suivant", E(lambda ed: ed.goto_bookmark(True)), sc("F2"))
@@ -4194,6 +5883,8 @@ class MainWindow(QMainWindow):
         menu("Marque-pages", ["bm", "bmnext", "bmprev", "bmclear", "-", "bmcut", "bmcopy", "bmdel", "bmkeep",
                               "bminv"], r)
         r.addAction(a["filter"])
+        r.addSeparator()
+        r.addAction(a["regex"])
         v = menu("Affichage", ["wrap"])
         menu("Symboles spéciaux", ["ws", "eol", "all"], v)
         for k in ("guides", "numbers", "toolbar"):
@@ -4254,6 +5945,9 @@ class MainWindow(QMainWindow):
         jinja.triggered.connect(self._with_ed(lambda ed: ed.set_language(ed.lang, ed.lang_forced,
                                                                          not ed.jinja)))
         tools = mb.addMenu("Outils")
+        tools.addAction(a["regex"])
+        tools.addAction(a["regexgen"])
+        tools.addSeparator()
         menu("JSON", ["json_fmt", "json_sort", "json_min", "json_check", "-", "jsontree"], tools)
         menu("Base64, URL, hexadécimal", ["b64", "b64np", "b64u", "b64unp", "b64d", "-", "urle", "urld", "-",
                                           "hexe", "hexd", "-", "jwt"], tools)
@@ -4267,7 +5961,7 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         tb.setIconSize(QSize(18, 18))
         for k in ("new", "open", "save", "saveall", "close", "-", "cut", "copy", "paste", "-", "undo", "redo", "-",
-                  "find", "replace", "-", "zoomin", "zoomout", "-", "wrap", "all", "guides", "-", "json_fmt",
+                  "find", "replace", "regex", "-", "zoomin", "zoomout", "-", "wrap", "all", "guides", "-", "json_fmt",
                   "compare"):
             if k == "-":
                 tb.addSeparator()
@@ -4971,6 +6665,36 @@ class MainWindow(QMainWindow):
             text = cur.selectedText()
         self.find_dialog.open_tab(tab, text)
 
+    def open_regex(self, selection=None):
+        if self.regex_dialog is None:
+            self.regex_dialog = RegexDialog(self)
+        if selection is None:
+            ed = self.current()
+            selection = ""
+            if ed is not None and ed.textCursor().hasSelection():
+                selection = ed.textCursor().selection().toRawText().replace("\u2029", "\n")
+        self.regex_dialog.present(selection)
+        return self.regex_dialog
+
+    def regex_from_selection(self, ed):
+        sel = ed.textCursor().selection().toRawText().replace("\u2029", "\n")
+        dlg = self.open_regex(selection=sel)
+        if sel.strip():
+            dlg.generate_from(sel)
+        else:
+            dlg.gen_tabs.setCurrentIndex(1)
+
+    def regex_to_find(self, tab, find, repl, case, word, dotall):
+        if self.find_dialog is None:
+            self.find_dialog = FindDialog(self)
+        fd = self.find_dialog
+        fd.open_tab(tab)
+        fd.load(find, repl, case, word, dotall)
+        if tab == 0:
+            fd.find(True)
+        elif tab == 3:
+            fd.mark_all()
+
     def find_again(self, forward):
         if self.find_dialog is None or not self.find_dialog.find_edit.currentText():
             self.open_find(0)
@@ -5302,6 +7026,10 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         for k in ("b64", "b64np", "b64d"):
             menu.addAction(a[k])
+        menu.addSeparator()
+        if ed.textCursor().hasSelection():
+            menu.addAction(a["regexgen"])
+        menu.addAction(a["regex"])
         if ed.lang == "json":
             menu.addSeparator()
             menu.addAction(a["json_fmt"])
@@ -5459,6 +7187,8 @@ class MainWindow(QMainWindow):
         if self.find_dialog is not None:
             self.find_dialog.stop_files()
             self.find_dialog.hide()
+        if self.regex_dialog is not None:
+            self.regex_dialog.hide()
         for win in self.compare_windows:
             win.close()
         ev.accept()

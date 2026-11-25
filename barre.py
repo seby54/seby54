@@ -2579,4 +2579,859 @@ class Bar(QWidget):
         if bid.startswith("org.python") or base.startswith("python") or app.name.lower().startswith("python"):
             key = self._ps_cache.get(app.pid)
             if key is None:
-                key = self._ps_cache[app.pid] = detect_script(app.p
+                key = self._ps_cache[app.pid] = detect_script(app.pid) or f"pid:{app.pid}"
+            return key
+        if app.path.endswith(".app"):
+            return norm_app(app.path)
+        return f"pid:{app.pid}"
+
+    def _new_entry(self, key, app):
+        if key.startswith("script:"):
+            return Entry(key, SCRIPTS[key][0], script_path(key), "script")
+        if key.startswith("pid:"):
+            return Entry(key, app.name or "Application", app.path, "process")
+        return Entry(key, app.name or display_name(key), key, "app")
+
+    def refresh(self, force=False):
+        running = self.backend.running_apps()
+        alive = {a.pid for a in running}
+        self._ps_cache = {pid: k for pid, k in self._ps_cache.items() if pid in alive}
+        self._script_pids = {pid: k for pid, k in self._script_pids.items() if pid in alive}
+        groups = {}
+        for app in running:
+            key = self._key_for(app)
+            if key is None:
+                continue
+            entry = groups.get(key)
+            if entry is None:
+                entry = groups[key] = self._new_entry(key, app)
+            entry.pids.append(app.pid)
+            entry.hidden_flags.append(app.hidden)
+        for key in groups:
+            if key not in self._order:
+                self._order.append(key)
+        self._order = [k for k in self._order if k in groups]
+        entries = []
+        for key in self.pins:
+            entry = groups.get(key) or entry_for_key(key)
+            if entry is None:
+                continue
+            entry.pinned = True
+            entries.append(entry)
+        entries += [groups[k] for k in self._order if k not in self.pins]
+        self._update_front()
+        for entry in entries:
+            entry.hidden = bool(entry.pids) and all(entry.hidden_flags)
+            entry.active = self.front_pid in entry.pids and not entry.hidden
+        if self._desktop_hidden:
+            back = {a.pid for a in running if not a.hidden}
+            if back & set(self._desktop_hidden):
+                self._desktop_hidden = []
+        sig = tuple((e.key, tuple(e.pids), e.active, e.pinned, e.hidden, e.name) for e in entries)
+        if force or sig != self._sig:
+            self.entries, self._sig = entries, sig
+            self.relayout()
+
+    def _update_front(self):
+        pid = self.backend.front_pid()
+        if pid and pid != self.own_pid and pid != self.front_pid:
+            self.front_pid = pid
+            return True
+        return False
+
+    def note_self_activated(self):
+        self._self_activated = True
+
+    def restore_focus_soon(self):
+        QTimer.singleShot(150, self, self._restore_focus)
+
+    def _restore_focus(self):
+        """Rend le focus à l'application d'avant si la barre l'avait pris."""
+        if not self._self_activated:
+            return
+        if any(f.isVisible() for f in self._flyouts.values()):
+            return
+        if self.settings_window is not None and self.settings_window.isVisible():
+            return
+        self._self_activated = False
+        if self.backend.front_pid() == self.own_pid and self.front_pid:
+            self.backend.activate_pid(self.front_pid)
+
+    # --- mise en page ---
+    def _clock_texts(self):
+        now = QTime.currentTime()
+        return now.toString("HH:mm"), QDate.currentDate().toString("dd/MM/yyyy")
+
+    def _small_font(self):
+        font = QFont(self.font())
+        font.setPixelSize(12)
+        return font
+
+    def relayout(self):
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        cy = h // 2
+        top = cy - BTN_H // 2
+        items = []
+        x = w - DESKTOP_W
+        items.append(Item("desktop", QRect(x, 0, DESKTOP_W, h)))
+        fm = QFontMetrics(self._small_font())
+        clock_w = max(fm.horizontalAdvance(t) for t in self._clock_texts()) + 24
+        x -= clock_w + 4
+        items.append(Item("clock", QRect(x, top, clock_w, BTN_H)))
+        tray_n = 3 if self.status.get("battery") else 2
+        tray_w = tray_n * 22 + 14
+        x -= tray_w + 4
+        items.append(Item("tray", QRect(x, top, tray_w, BTN_H)))
+        right_edge = x - 12
+
+        fixed = [("start", BTN_W)]
+        search_mode = self.options["search"]
+        if search_mode == "box":
+            fixed.append(("search", SEARCH_W))
+        elif search_mode == "icon":
+            fixed.append(("search", BTN_W))
+        if self.options["taskview"]:
+            fixed.append(("taskview", BTN_W))
+        fixed_w = sum(fw for _k, fw in fixed) + GAP * len(fixed)
+        apps = list(self.entries)
+        capacity = max(0, (right_edge - 12 - fixed_w) // (BTN_W + GAP))
+        overflow = []
+        if len(apps) > capacity:
+            keep = max(0, capacity - 1)
+            apps, overflow = apps[:keep], apps[keep:]
+        total = fixed_w + (len(apps) + (1 if overflow else 0)) * (BTN_W + GAP) - GAP
+        if self.options["align"] == "center":
+            x0 = (w - total) // 2
+            x0 = min(x0, right_edge - total)
+        else:
+            x0 = 12
+        x0 = max(12, x0)
+        x = x0
+        for kind, fw in fixed:
+            rect = QRect(x, top, fw, BTN_H)
+            if kind == "search" and fw == SEARCH_W:
+                rect = QRect(x, cy - 17, fw, 34)
+            items.append(Item(kind, rect))
+            x += fw + GAP
+        for entry in apps:
+            items.append(Item("app", QRect(x, top, BTN_W, BTN_H), entry))
+            x += BTN_W + GAP
+        if overflow:
+            item = Item("overflow", QRect(x, top, BTN_W, BTN_H))
+            item.entry = overflow
+            items.append(item)
+        self.items = items
+        self.hover = None if self.hover is None or self.hover >= len(items) else self.hover
+        self.update()
+
+    def item_at(self, pos):
+        for i, item in enumerate(self.items):
+            if item.rect.contains(pos):
+                return i
+        if pos.y() >= 0 and pos.x() >= self.width() - DESKTOP_W:
+            return next((i for i, it in enumerate(self.items) if it.kind == "desktop"), None)
+        return None
+
+    # --- dessin ---
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.fillRect(self.rect(), Theme.c("bar"))
+        p.fillRect(QRect(0, 0, self.width(), 1), Theme.c("bar_line"))
+        for i, item in enumerate(self.items):
+            if self._drag and item.kind == "app" and item.entry.key == self._drag:
+                continue
+            self._paint_item(p, i, item)
+        if self._drag:
+            self._paint_drag(p)
+        p.end()
+
+    def _flyout_open(self, name):
+        fly = self._flyouts.get(name)
+        return fly is not None and fly.isVisible()
+
+    def _paint_bg(self, p, rect, i, active=False):
+        color = None
+        if self.pressed == i and self.hover == i:
+            color = Theme.c("press")
+        elif self.hover == i:
+            color = Theme.c("hover")
+        elif active:
+            color = Theme.c("active")
+        if color is not None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            p.drawRoundedRect(QRectF(rect), 4, 4)
+
+    def _icon_rect(self, rect, i, size=24, key=None):
+        scale = 0.86 if (self.pressed == i and self.hover == i) else 1.0
+        s = size * scale
+        dy = 0.0
+        if key and key in self._bounce:
+            t = time.monotonic() - self._bounce[key]
+            if t < 0.45:
+                dy = -5 * math.sin(math.pi * t / 0.45)
+        c = QRectF(rect).center()
+        return QRectF(c.x() - s / 2, c.y() - s / 2 + dy - 1, s, s)
+
+    def _paint_item(self, p, i, item):
+        kind, rect = item.kind, item.rect
+        text = Theme.c("text")
+        if kind == "start":
+            self._paint_bg(p, rect, i, self._flyout_open("start"))
+            glyph(p, "start", self._icon_rect(rect, i, 22))
+        elif kind == "search":
+            if rect.width() == SEARCH_W:
+                r = QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5)
+                p.setPen(QPen(Theme.c("field_border"), 1))
+                p.setBrush(Theme.c("hover") if self.hover == i else Theme.c("search_box"))
+                p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+                glyph(p, "search", QRectF(r.x() + 14, r.center().y() - 8, 16, 16), Theme.c("sub"))
+                font = QFont(self.font())
+                font.setPixelSize(13)
+                p.setFont(font)
+                p.setPen(Theme.c("dim"))
+                p.drawText(r.adjusted(40, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           "Rechercher")
+            else:
+                self._paint_bg(p, rect, i)
+                glyph(p, "search", self._icon_rect(rect, i, 20), text)
+        elif kind == "taskview":
+            self._paint_bg(p, rect, i)
+            glyph(p, "taskview", self._icon_rect(rect, i, 20), text)
+        elif kind == "app":
+            entry = item.entry
+            self._paint_bg(p, rect, i, entry.active)
+            icon_for(entry.key, entry.path).paint(p, self._icon_rect(rect, i, 24, entry.key).toRect())
+            if entry.running:
+                p.setPen(Qt.PenStyle.NoPen)
+                if entry.active:
+                    p.setBrush(Theme.c("accent"))
+                    p.drawRoundedRect(QRectF(rect.center().x() - 8, rect.bottom() - 2.5, 16, 3), 1.5, 1.5)
+                else:
+                    p.setBrush(Theme.c("running"))
+                    p.drawRoundedRect(QRectF(rect.center().x() - 3, rect.bottom() - 2.5, 6, 3), 1.5, 1.5)
+        elif kind == "overflow":
+            self._paint_bg(p, rect, i)
+            glyph(p, "dots", self._icon_rect(rect, i, 18), text)
+        elif kind == "tray":
+            self._paint_bg(p, rect, i, self._flyout_open("quick"))
+            x = rect.x() + 9
+            cy = rect.center().y()
+            net = self.status.get("network")
+            glyph(p, {"wifi": "wifi", "ethernet": "ethernet"}.get(net, "offline"), QRectF(x, cy - 8, 16, 16), text)
+            vol = self.status.get("volume")
+            level, muted = (int(vol[0] * 100), vol[1]) if vol else (60, False)
+            glyph(p, "speaker", QRectF(x + 22, cy - 8, 16, 16), text, level=level, muted=muted)
+            bat = self.status.get("battery")
+            if bat:
+                glyph(p, "battery", QRectF(x + 44, cy - 8, 16, 16), text,
+                      percent=bat["percent"], charging=bat["charging"])
+        elif kind == "clock":
+            self._paint_bg(p, rect, i, self._flyout_open("calendar"))
+            p.setFont(self._small_font())
+            p.setPen(text)
+            t, d = self._clock_texts()
+            half = rect.height() // 2
+            p.drawText(QRect(rect.x(), rect.y() + 3, rect.width(), half - 2),
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, t)
+            p.drawText(QRect(rect.x(), rect.y() + half + 1, rect.width(), half - 4),
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, d)
+        elif kind == "desktop":
+            if self.hover == i:
+                p.fillRect(QRect(rect.x() + 2, rect.y() + 12, 1, rect.height() - 24), Theme.c("dim"))
+
+    def _paint_drag(self, p):
+        entry = next((it.entry for it in self.items if it.kind == "app" and it.entry.key == self._drag), None)
+        if entry is None:
+            return
+        target = self._drop_index(self._drag_x, exclude=self._drag)
+        pinned = [it for it in self.items if it.kind == "app" and it.entry.pinned and it.entry.key != self._drag]
+        if pinned:
+            if target < len(pinned):
+                mx = pinned[target].rect.x() - GAP
+            else:
+                mx = pinned[-1].rect.right() + GAP
+            p.fillRect(QRect(mx - 1, (self.height() - 28) // 2, 2, 28), Theme.c("accent"))
+        rect = QRect(self._drag_x - BTN_W // 2, (self.height() - BTN_H) // 2, BTN_W, BTN_H)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(Theme.c("hover"))
+        p.drawRoundedRect(QRectF(rect), 4, 4)
+        icon_for(entry.key, entry.path).paint(p, QRect(rect.center().x() - 12, rect.center().y() - 12, 24, 24))
+
+    def _drop_index(self, x, exclude=None):
+        pinned = [it for it in self.items if it.kind == "app" and it.entry.pinned and it.entry.key != exclude]
+        return sum(1 for it in pinned if it.rect.center().x() < x)
+
+    # --- souris ---
+    def _set_hover(self, idx):
+        if idx != self.hover:
+            self.hover = idx
+            self.tip.hide()
+            if idx is not None:
+                self._tip_timer.start()
+            else:
+                self._tip_timer.stop()
+            self.update()
+
+    def _tip_text(self, item):
+        kind = item.kind
+        if kind == "start":
+            return "Démarrer"
+        if kind == "search":
+            return "Rechercher"
+        if kind == "taskview":
+            return "Vue des tâches"
+        if kind == "app":
+            return item.entry.name
+        if kind == "overflow":
+            return "Afficher plus d'applications"
+        if kind == "desktop":
+            return "Afficher le bureau"
+        if kind == "clock":
+            text = FRENCH.toString(QDate.currentDate(), "dddd d MMMM yyyy")
+            return text[:1].upper() + text[1:]
+        if kind == "tray":
+            net = {"wifi": "Wi-Fi : connecté", "ethernet": "Réseau : connecté"}.get(
+                self.status.get("network"), "Pas d'accès réseau")
+            lines = [net]
+            vol = self.status.get("volume")
+            if vol:
+                lines.append("Son : muet" if vol[1] else f"Son : {int(round(vol[0] * 100))} %")
+            bat = self.status.get("battery")
+            if bat:
+                lines.append(f"Batterie : {bat['percent']} %" + (" (en charge)" if bat["charging"] else ""))
+            return "\n".join(lines)
+        return ""
+
+    def _show_tip(self):
+        if self.hover is None or self.pressed is not None or self._drag or self.hover >= len(self.items):
+            return
+        if self.flyout is not None and self.flyout.isVisible():
+            return
+        item = self.items[self.hover]
+        text = self._tip_text(item)
+        if text:
+            anchor = QRect(self.mapToGlobal(item.rect.topLeft()), item.rect.size())
+            self.tip.show_text(text, anchor, self.geometry().y())
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.RightButton:
+            return
+        pos = ev.position().toPoint()
+        self.pressed = self.item_at(pos)
+        self.hover = self.pressed
+        self._press_pos = pos
+        self.tip.hide()
+        self._tip_timer.stop()
+        self.update()
+
+    def mouseMoveEvent(self, ev):
+        pos = ev.position().toPoint()
+        if self.pressed is not None and ev.buttons() & Qt.MouseButton.LeftButton:
+            item = self.items[self.pressed] if self.pressed < len(self.items) else None
+            if (not self._drag and item is not None and item.kind == "app" and item.entry.pinned
+                    and abs(pos.x() - self._press_pos.x()) > 6):
+                self._drag = item.entry.key
+            if self._drag:
+                self._drag_x = pos.x()
+                self.update()
+                return
+        self._set_hover(self.item_at(pos))
+
+    def mouseReleaseEvent(self, ev):
+        pos = ev.position().toPoint()
+        if self._drag:
+            self._finish_drag(pos.x())
+            self.pressed = None
+            return
+        idx, pressed = self.item_at(pos), self.pressed
+        self.pressed = None
+        self.update()
+        if idx is None or idx != pressed or idx >= len(self.items):
+            return
+        item = self.items[idx]
+        if ev.button() == Qt.MouseButton.LeftButton:
+            new = bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self.activate_item(item, new)
+        elif ev.button() == Qt.MouseButton.MiddleButton and item.kind == "app":
+            self.click_entry(item.entry, new=True)
+
+    def leaveEvent(self, _ev):
+        if self.pressed is None:
+            self._set_hover(None)
+
+    def wheelEvent(self, ev):
+        idx = self.item_at(ev.position().toPoint())
+        if idx is not None and self.items[idx].kind == "tray":
+            vol = self.backend.volume()
+            if vol is not None:
+                step = 0.02 if ev.angleDelta().y() > 0 else -0.02
+                self.backend.set_volume(max(0.0, min(1.0, vol[0] + step)))
+                self.read_volume()
+
+    def contextMenuEvent(self, ev):
+        idx = self.item_at(ev.pos())
+        self.pressed = None
+        item = self.items[idx] if idx is not None else None
+        self.tip.hide()
+        if item is None:
+            self.empty_menu(ev.globalPos())
+        elif item.kind == "app":
+            self.app_menu(item)
+        elif item.kind == "start":
+            self.start_context(item)
+        elif item.kind == "tray":
+            self.tray_menu(item)
+        elif item.kind == "clock":
+            self._menu_above(item, [("Ajuster la date et l'heure",
+                                     lambda: open_pane("com.apple.Date-Time-Settings.extension"), None)])
+        else:
+            self.empty_menu(ev.globalPos())
+
+    def _poll_fast(self):
+        self._tick += 1
+        if self._tick % 6 == 0 and self._update_front():
+            self.refresh(force=True)
+        pos = QCursor.pos()
+        geo = self.geometry()
+        near = geo.adjusted(0, -160, 0, 0).contains(pos)
+        if geo.contains(pos):
+            if self.pressed is None and not self._drag:
+                self._set_hover(self.item_at(pos - geo.topLeft()))
+        elif self.hover is not None and self.pressed is None:
+            self._set_hover(None)
+        fly = self.flyout
+        busy = fly is not None and fly.isVisible()
+        if busy:
+            buttons = self.backend.mouse_buttons()
+            if buttons and not self._buttons_prev and QApplication.activePopupWidget() is None:
+                if not fly.geometry().contains(pos) and not geo.contains(pos):
+                    fly.close_flyout()
+            self._buttons_prev = buttons
+            fly.check_focus()
+        else:
+            self._buttons_prev = 0
+        interval = 40 if (near or busy or self._drag) else 150
+        if self._fast.interval() != interval:
+            self._fast.setInterval(interval)
+
+    def _poll_slow(self):
+        self.refresh()
+        self.read_volume()
+        reap_children()
+        minute = QTime.currentTime().minute()
+        if getattr(self, "_minute", None) != minute:
+            self._minute = minute
+            self.relayout()
+        self._slow_ticks = getattr(self, "_slow_ticks", 0) + 1
+        if self._slow_ticks % 2 == 0:
+            self.backend.configure_window(self, "bar")
+        if self._slow_ticks % 60 == 0:
+            problems = controle_reseau()
+            if problems:
+                print("[verrou] bibliothèque réseau détectée, arrêt : " + ", ".join(problems), file=sys.stderr)
+                self.quit_bar()
+
+    def _anim_tick(self):
+        now = time.monotonic()
+        self._bounce = {k: t for k, t in self._bounce.items() if now - t < 0.45}
+        if not self._bounce:
+            self._anim.stop()
+        self.update()
+
+    def bounce(self, key):
+        self._bounce[key] = time.monotonic()
+        self._anim.start()
+
+    # --- état (son, réseau, batterie) ---
+    def read_volume(self):
+        vol = self.backend.volume()
+        if vol != self.status.get("volume"):
+            self.status["volume"] = vol
+            self.update()
+
+    def read_status(self):
+        self.async_.run("battery", read_battery)
+        self.async_.run("network", read_network)
+
+    def _on_async(self, key, result):
+        if key in ("battery", "network") and result != self.status.get(key):
+            if key == "network" and result is None:
+                return
+            self.status[key] = result
+            self.relayout()
+
+    # --- actions ---
+    def activate_item(self, item, new=False):
+        kind = item.kind
+        self.tip.hide()
+        if kind == "start":
+            self.toggle_flyout("start")
+        elif kind == "search":
+            self.toggle_flyout("start")
+        elif kind == "taskview":
+            open_app(MISSION_CONTROL)
+        elif kind == "app":
+            self.click_entry(item.entry, new)
+        elif kind == "overflow":
+            self.overflow_menu(item)
+        elif kind == "tray":
+            self.toggle_flyout("quick")
+        elif kind == "clock":
+            self.toggle_flyout("calendar")
+        elif kind == "desktop":
+            self.toggle_desktop()
+
+    def click_entry(self, entry, new=False):
+        """Clic sur une application, comme sous Windows."""
+        self._desktop_hidden = []
+        if new or not entry.running:
+            self.launch_entry(entry, new)
+        elif entry.active:
+            for pid in entry.pids:                      # déjà au premier plan : on la réduit
+                self.backend.hide_app(pid)
+        else:
+            self.bring_front(entry)
+        QTimer.singleShot(200, self, lambda: self.refresh(force=True))
+        QTimer.singleShot(900, self, lambda: self.refresh(force=True))
+
+    def launch_entry(self, entry, new=False):
+        if entry.kind == "script":
+            proc = run_script(entry.key)
+            if proc is not None:
+                self._script_pids[proc.pid] = entry.key
+        elif entry.kind == "app":
+            open_app(entry.path)
+        elif entry.pids:
+            self.backend.activate_pid(entry.pids[0])
+            return
+        self.bounce(entry.key)
+        for delay in (300, 900, 2000):
+            QTimer.singleShot(delay, self, lambda: self.refresh(force=True))
+
+    def launch_key(self, key):
+        """Ouverture depuis Démarrer : lance, ou ramène au premier plan (sans jamais réduire)."""
+        entry = next((e for e in self.entries if e.key == key), None) or entry_for_key(key)
+        if entry is None:
+            if not key.startswith("script:"):
+                open_app(key)
+            return
+        if not entry.running or entry.kind == "script":
+            self.launch_entry(entry, new=entry.running)      # l'explorateur : nouvelle fenêtre
+        else:
+            self.bring_front(entry)
+
+    def bring_front(self, entry):
+        for pid in entry.pids:
+            self.backend.unhide_app(pid)
+        if entry.kind == "app":
+            open_app(entry.path)                        # comme un clic dans le Dock
+        else:
+            pid = entry.pids[0]
+            self.backend.activate_pid(pid)
+            # macOS 14 peut ignorer la demande d'une appli en arrière-plan : on réessaie
+            # en passant d'abord par la barre (c'est l'utilisateur qui a cliqué).
+            QTimer.singleShot(250, self, lambda: self._activate_retry(pid))
+        self.front_pid = entry.pids[0]
+
+    def _activate_retry(self, pid):
+        if self.backend.front_pid() != pid:
+            self.backend.activate_self()
+            self.backend.activate_pid(pid)
+
+    def toggle_desktop(self):
+        """Afficher le bureau, puis un second clic remet tout comme avant."""
+        if self._desktop_hidden:
+            for pid in self._desktop_hidden:
+                self.backend.unhide_app(pid)
+            if self._desktop_front:
+                self.backend.activate_pid(self._desktop_front)
+            self._desktop_hidden = []
+        else:
+            visible = [a.pid for a in self.backend.running_apps() if not a.hidden and a.pid != self.own_pid]
+            if not visible:
+                return
+            self._desktop_front = self.front_pid
+            for pid in visible:
+                self.backend.hide_app(pid)
+            self._desktop_hidden = visible
+        QTimer.singleShot(250, self, lambda: self.refresh(force=True))
+
+    # --- épingles ---
+    def _pins(self, which):
+        return self.pins if which == "taskbar" else self.start_pins
+
+    def pin(self, which, key, index=None):
+        pins = self._pins(which)
+        if key in pins:
+            return
+        pins.insert(len(pins) if index is None else index, key)
+        set_pins(which, pins)
+        self.refresh(force=True)
+
+    def unpin(self, which, key):
+        pins = self._pins(which)
+        if key in pins:
+            pins.remove(key)
+            set_pins(which, pins)
+            self.refresh(force=True)
+
+    def move_first(self, which, key):
+        pins = self._pins(which)
+        if key in pins:
+            pins.remove(key)
+            pins.insert(0, key)
+            set_pins(which, pins)
+
+    def _finish_drag(self, x):
+        key, self._drag = self._drag, None
+        index = self._drop_index(x, exclude=key)
+        if key in self.pins:
+            self.pins.remove(key)
+            self.pins.insert(index, key)
+            set_pins("taskbar", self.pins)
+        self.refresh(force=True)
+
+    @staticmethod
+    def app_paths(mime):
+        out = []
+        for url in mime.urls() if mime.hasUrls() else []:
+            if url.isLocalFile():
+                path = url.toLocalFile().rstrip("/")
+                if path.endswith(".app") and os.path.isdir(path):
+                    out.append(norm_app(path))
+        return out
+
+    def dragEnterEvent(self, ev):
+        if self.app_paths(ev.mimeData()):
+            ev.acceptProposedAction()
+
+    def dragMoveEvent(self, ev):
+        if self.app_paths(ev.mimeData()):
+            ev.acceptProposedAction()
+
+    def dropEvent(self, ev):
+        paths = self.app_paths(ev.mimeData())
+        if not paths:
+            return
+        index = self._drop_index(ev.position().toPoint().x())
+        for path in paths:
+            if path not in self.pins:
+                self.pins.insert(index, path)
+                index += 1
+        set_pins("taskbar", self.pins)
+        ev.acceptProposedAction()
+        self.refresh(force=True)
+
+    # --- menus ---
+    def _menu_above(self, item, actions, menu=None):
+        menu = menu or make_menu(self)
+        for text, fn, icon in actions:
+            if text is None:
+                menu.addSeparator()
+            else:
+                add_action(menu, text, fn, icon)
+        size = menu.sizeHint()
+        center = self.mapToGlobal(item.rect.center())
+        x = center.x() - size.width() // 2
+        menu.exec(QPoint(x, self.geometry().y() - size.height() - 8))
+        menu.deleteLater()
+
+    def app_menu(self, item):
+        entry = item.entry
+        actions = []
+        if entry.kind != "process":
+            actions.append((entry.name, lambda: self.click_entry(entry, new=True), icon_for(entry.key, entry.path)))
+        if entry.kind in ("app", "script"):
+            if entry.pinned:
+                actions.append(("Détacher de la barre des tâches", lambda: self.unpin("taskbar", entry.key), None))
+            else:
+                actions.append(("Épingler à la barre des tâches", lambda: self.pin("taskbar", entry.key), None))
+        if entry.running:
+            actions.append(("Fermer toutes les fenêtres", lambda: self.quit_entry(entry), None))
+        self._menu_above(item, actions)
+
+    def quit_entry(self, entry):
+        for pid in entry.pids:
+            self.backend.quit_app(pid)
+        QTimer.singleShot(600, self, lambda: self.refresh(force=True))
+
+    def start_context(self, item):
+        explorer = lambda: self.launch_key("script:explorateur")  # noqa: E731
+        self._menu_above(item, [
+            ("Applications installées", lambda: open_path("/Applications"), None),
+            ("Moniteur d'activité", lambda: open_app(ACTIVITY_MONITOR), None),
+            ("Paramètres", lambda: open_app(SYSTEM_SETTINGS), None),
+            ("Explorateur de fichiers", explorer, None),
+            ("Rechercher", lambda: self.toggle_flyout("start"), None),
+            ("Terminal", lambda: open_app(TERMINAL), None),
+            (None, None, None),
+            ("Mettre en veille", lambda: spawn([CMD["pmset"], "sleepnow"]), None),
+            (None, None, None),
+            ("Bureau", self.toggle_desktop, None),
+        ])
+
+    def tray_menu(self, item):
+        actions = [("Paramètres réseau", lambda: open_pane("com.apple.Network-Settings.extension"), None),
+                   ("Paramètres du son", lambda: open_pane("com.apple.Sound-Settings.extension"), None)]
+        if self.status.get("battery"):
+            actions.append(("Paramètres de la batterie", lambda: open_pane("com.apple.Battery-Settings.extension"), None))
+        self._menu_above(item, actions)
+
+    def empty_menu(self, global_pos):
+        menu = make_menu(self)
+        add_action(menu, "Moniteur d'activité", lambda: open_app(ACTIVITY_MONITOR))
+        add_action(menu, "Paramètres de la barre des tâches", self.open_settings, "gear")
+        menu.addSeparator()
+        add_action(menu, "Quitter la barre des tâches", self.quit_bar)
+        size = menu.sizeHint()
+        menu.exec(QPoint(global_pos.x(), self.geometry().y() - size.height() - 8))
+        menu.deleteLater()
+
+    def overflow_menu(self, item):
+        menu = make_menu(self)
+        for entry in item.entry:
+            add_action(menu, entry.name, lambda e=entry: self.click_entry(e), icon_for(entry.key, entry.path))
+        self._menu_above(item, [], menu)
+
+    # --- panneaux ---
+    def flyout_rect(self, name, size):
+        bar = self.geometry()
+        screen = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        w = size.width()
+        h = min(size.height(), bar.y() - screen.y() - 24)
+        if name == "start":
+            x = bar.center().x() - w // 2 if self.options["align"] == "center" else bar.x() + 12
+        else:
+            x = bar.right() - w - 12
+        return QRect(x, bar.y() - h - 12, w, h)
+
+    def toggle_flyout(self, name):
+        fly = self._flyouts.get(name)
+        if fly is not None and fly.isVisible():
+            fly.close_flyout()
+            return
+        last, when = self._closed_at
+        if last == name and time.monotonic() - when < 0.3:
+            return              # le clic qui vient de le fermer ne doit pas le rouvrir
+        if self.flyout is not None and self.flyout.isVisible():
+            self.flyout.close_flyout()
+        if fly is None:
+            fly = {"start": StartMenu, "calendar": CalendarFlyout, "quick": QuickFlyout}[name](self)
+            fly.closed.connect(lambda n=name: self._on_flyout_closed(n))
+            self._flyouts[name] = fly
+        self.flyout = fly
+        fly.open()
+        self.update()
+
+    def _on_flyout_closed(self, name):
+        self._closed_at = (name, time.monotonic())
+        self.update()
+        self.restore_focus_soon()
+
+    def open_settings(self):
+        if self.settings_window is None:
+            self.settings_window = TaskbarSettings(self)
+        win = self.settings_window
+        win.show()
+        self.backend.configure_window(win, "dialog")
+        self.backend.activate_self()
+        win.raise_()
+        win.activateWindow()
+        self.note_self_activated()
+
+    def apply_settings(self):
+        self.options = {k: opt(k) for k in DEFAULTS}
+        self.refresh(force=True)
+        self.relayout()
+        start = self._flyouts.get("start")
+        if start:
+            start.retheme()
+
+    def retheme(self):
+        for key in [k for k in _ICONS if k.startswith("script:")]:
+            _ICONS.pop(key, None)
+        for fly in self._flyouts.values():
+            if hasattr(fly, "retheme"):
+                fly.retheme()
+            fly.update()
+        if self.settings_window is not None:
+            self.settings_window.close()
+            self.settings_window.deleteLater()
+            self.settings_window = None
+        self.update()
+
+    def quit_bar(self):
+        self._quitting = True
+        for fly in self._flyouts.values():
+            fly.hide()
+        self.tip.hide()
+        if self.settings_window is not None:
+            self.settings_window.hide()
+        QApplication.instance().quit()
+
+    def closeEvent(self, ev):
+        # Cmd+Q ne ferme pas la barre par accident : on passe par « Quitter la barre des tâches ».
+        if self._quitting:
+            ev.accept()
+        else:
+            ev.ignore()
+
+
+# ======================================================================================
+
+def make_backend():
+    if IS_MAC:
+        try:
+            return MacBackend()
+        except (OSError, RuntimeError, AttributeError) as exc:
+            print(f"[barre] mode simplifié ({exc})", file=sys.stderr)
+    return Backend()
+
+
+def main():
+    global NATIVE
+    installer_verrou()
+    if IS_MAC:
+        # La barre ne doit pas devenir une application « normale » (icône du Dock, Cmd+Tab).
+        os.environ["QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM"] = "1"
+    app = QApplication([sys.argv[0]])
+    os.environ.pop("QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM", None)
+    app.setApplicationName(APP_NAME)
+    app.setOrganizationName(ORG_NAME)
+    app.setQuitOnLastWindowClosed(False)
+    lock = QLockFile(os.path.join(QDir.tempPath(), "barre-des-taches.lock"))
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(200):
+        print("[barre] déjà lancée", file=sys.stderr)
+        return 0
+    NATIVE = make_backend()
+    NATIVE.setup_app()
+    Theme.detect()
+    apply_theme(app)
+    problems = controle_reseau()
+    if problems:
+        print("[verrou] arrêt, bibliothèques réseau présentes : " + ", ".join(problems), file=sys.stderr)
+        return 3
+    bar = Bar(NATIVE)
+    bar.show()
+
+    def on_scheme(*_args):
+        Theme.detect()
+        apply_theme(app)
+        bar.retheme()
+    try:
+        app.styleHints().colorSchemeChanged.connect(on_scheme)
+    except AttributeError:
+        pass
+    code = app.exec()
+    lock.unlock()
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

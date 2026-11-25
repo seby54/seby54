@@ -364,6 +364,21 @@ def vscode_path():
     return shutil.which("code") or ""
 
 
+ANNOTATE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def annoter_script():
+    """L'annoteur (annoter.py), s'il est rangé à côté de ce programme."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "annoter.py")
+    return path if os.path.isfile(path) else ""
+
+
+def blocnotes_script():
+    """Bloc-notes Pro (blocnotes.py), s'il est rangé à côté de ce programme."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocnotes.py")
+    return path if os.path.isfile(path) else ""
+
+
 def detached(program, args, workdir=""):
     program = CMD.get(program, program)
     if workdir:
@@ -713,6 +728,30 @@ def _(p, c):
     _poly(p, (5.4, 4.4), (2.2, 8.0), (5.4, 11.6))
     _poly(p, (10.6, 4.4), (13.8, 8.0), (10.6, 11.6))
     _line(p, 9.1, 3.2, 6.9, 12.8)
+
+
+@_icon("annotate")
+def _(p, c):
+    _pen(p, "#E81123", 1.3)
+    p.drawRoundedRect(QRectF(1.8, 3.2, 9.4, 7.4), 1.0, 1.0)
+    _pen(p, c, 1.2)
+    p.drawPolygon(QPolygonF([QPointF(12.6, 6.0), QPointF(14.4, 7.8), QPointF(8.4, 13.8), QPointF(6.2, 14.4),
+                             QPointF(6.8, 12.2)]))
+
+
+@_icon("notepad")
+def _(p, c):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#FFFFFF"))
+    p.drawRect(QRectF(2.5, 1.5, 11, 13))
+    _pen(p, "#7A8696", 0.9)
+    p.drawRect(QRectF(2.5, 1.5, 11, 13))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#1A9E8F"))
+    p.drawRect(QRectF(2.5, 1.5, 11, 2.6))
+    p.setBrush(QColor("#5B6B7F"))
+    for y, w in ((6.2, 7.6), (8.4, 5.8), (10.6, 6.8)):
+        p.drawRect(QRectF(4.2, y, w, 0.9))
 
 
 @_icon("moreoptions")
@@ -3807,6 +3846,17 @@ class MainWindow(QMainWindow):
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path if os.path.isdir(path) else pdir(path)))
 
+    def annotate(self, paths):
+        script = annoter_script()
+        for path in [p for p in paths if ext_of(p) in ANNOTATE_EXTS][:5]:
+            detached(sys.executable, [script, path])
+
+    def edit_in_blocnotes(self, paths):
+        script = blocnotes_script()
+        files = [p for p in paths if p and p not in SPECIAL_LOCS and os.path.isfile(p)][:20]
+        if script and files:
+            detached(sys.executable, [script] + files)
+
     def open_in_vscode(self, paths):
         app = vscode_path()
         paths = [p for p in paths if p and p not in SPECIAL_LOCS]
@@ -4265,6 +4315,10 @@ class MainWindow(QMainWindow):
             menu_item(menu, "Aperçu", self.quick_look, shortcut="Espace")
         if vscode_path():
             menu_item(menu, "Ouvrir avec Code", lambda: self.open_in_vscode(paths), icon="code")
+        if blocnotes_script() and not folder and any(os.path.isfile(p) for p in paths):
+            menu_item(menu, "Ouvrir avec Bloc-notes Pro", lambda: self.edit_in_blocnotes(paths), icon="notepad")
+        if annoter_script() and any(ext_of(p) in ANNOTATE_EXTS for p in paths):
+            menu_item(menu, "Annoter", lambda: self.annotate(paths), icon="annotate")
         if folder:
             menu_item(menu, "Épingler dans Accès rapide", lambda: self.pin(folder), icon="pin")
         menu_item(menu, "Compresser en fichier ZIP", self.compress_selection, icon="zip")

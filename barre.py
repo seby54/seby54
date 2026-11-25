@@ -49,6 +49,7 @@ CMD = {
 SCRIPTS = {
     "script:explorateur": ("Explorateur de fichiers", ("explor.py", "explorateur.py")),
     "script:annoteur": ("Annoteur", ("annoter.py",)),
+    "script:blocnotes": ("Bloc-notes Pro", ("blocnotes.py",)),
 }
 
 FINDER = "/System/Library/CoreServices/Finder.app"
@@ -1089,6 +1090,23 @@ def _(p, c):
     p.drawLine(QPointF(13.0, 12.0), QPointF(9.2, 8.2))
 
 
+@_glyph("blocnotes")
+def _(p, c):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#FFFFFF"))
+    p.drawRect(QRectF(2.5, 1.2, 11, 13.6))
+    _pen(p, "#7A8696", 0.8)
+    p.drawRect(QRectF(2.5, 1.2, 11, 13.6))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#1A9E8F"))
+    p.drawRect(QRectF(2.5, 1.2, 11, 2.6))
+    p.setBrush(QColor("#5B6B7F"))
+    for y, w in ((6.2, 8.0), (8.3, 6.2), (10.4, 7.2), (12.5, 4.8)):
+        p.drawRoundedRect(QRectF(4.0, y, w, 0.9), 0.4, 0.4)
+    _pen(p, "#E8A317", 1.7)
+    p.drawLine(QPointF(15.0, 7.0), QPointF(10.2, 13.4))
+
+
 @_glyph("appwin")
 def _(p, c):
     p.setPen(Qt.PenStyle.NoPen)
@@ -1197,6 +1215,8 @@ def icon_for(key, path=""):
             icon = glyph_icon("folder")
         elif key == "script:annoteur":
             icon = glyph_icon("annoteur")
+        elif key == "script:blocnotes":
+            icon = glyph_icon("blocnotes")
         elif path and os.path.exists(path):
             icon = icon_provider().icon(QFileInfo(path))
         else:

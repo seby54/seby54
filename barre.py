@@ -272,7 +272,7 @@ def open_path(path):
     return spawn([CMD["open"], path])
 
 
-def reveal(path):
+def reveal_file(path):
     folder = os.path.dirname(path.rstrip("/"))
     if script_path("script:explorateur"):
         return run_script("script:explorateur", [folder])
@@ -761,7 +761,7 @@ class MacBackend(Backend):
 # ======================================================================================
 
 from PySide6.QtCore import (QDate, QDir, QEasingCurve, QEvent, QFileInfo, QLocale, QLockFile,  # noqa: E402
-                            QObject, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSettings,
+                            QObject, QParallelAnimationGroup, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSettings,
                             QSize, QTime, QTimer, Qt, Signal)
 from PySide6.QtGui import (QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QIcon,  # noqa: E402
                            QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF)
@@ -1325,7 +1325,7 @@ def rank_panes(query):
 # ---- réglages ------------------------------------------------------------------------
 
 DEFAULTS = {"align": "center", "search": "box", "taskview": True, "finder": False,
-            "docs": True, "show_name": True}
+            "docs": True, "show_name": True, "all_screens": True, "autohide": False}
 
 
 def conf():
@@ -1413,6 +1413,61 @@ def entry_for_key(key):
     return None
 
 
+# Une barre par écran : elles partagent les épingles, les réglages et l'état du système.
+BARS = []
+_SHARED = {}
+_SETTINGS = []
+MANAGER = []
+
+
+def shared_state():
+    if not _SHARED:
+        _SHARED.update(pins=get_pins("taskbar"), start_pins=get_pins("start"),
+                       options={k: opt(k) for k in DEFAULTS},
+                       status={"battery": None, "network": "wifi" if IS_MAC else "ethernet", "volume": None})
+    return _SHARED
+
+
+def main_bar():
+    return next((b for b in BARS if b.is_main), BARS[0] if BARS else None)
+
+
+def refresh_all():
+    for bar in list(BARS):
+        bar.refresh(force=True)
+
+
+def apply_all():
+    """Après un changement de réglage : toutes les barres suivent."""
+    shared_state()["options"].update({k: opt(k) for k in DEFAULTS})
+    if MANAGER:
+        MANAGER[0].sync()
+    for bar in list(BARS):
+        if not bar.options.get("autohide"):
+            bar.reveal()
+        bar.refresh(force=True)
+        bar.relayout()
+        start = bar._flyouts.get("start")
+        if start:
+            start.retheme()
+
+
+def settings_window():
+    return _SETTINGS[0] if _SETTINGS else None
+
+
+def quit_all():
+    for bar in list(BARS):
+        bar._quitting = True
+        for fly in bar._flyouts.values():
+            fly.hide()
+        bar.tip.hide()
+    win = settings_window()
+    if win is not None:
+        win.hide()
+    QApplication.instance().quit()
+
+
 def account_name():
     return os.environ.get("USER") or os.path.basename(HOME) or "Utilisateur"
 
@@ -1430,7 +1485,10 @@ class Async(QObject):
             except Exception as exc:  # une lecture ratée ne doit jamais faire tomber la barre
                 print(f"[barre] {key} : {exc}", file=sys.stderr)
                 result = None
-            self.done.emit(key, result)
+            try:
+                self.done.emit(key, result)
+            except RuntimeError:
+                pass            # la barre a été retirée entre-temps
         threading.Thread(target=work, daemon=True).start()
 
 
@@ -2044,7 +2102,7 @@ class StartMenu(Flyout):
         menu = make_menu(self)
         if kind == "doc":
             add_action(menu, "Ouvrir", lambda: self._run(lambda: open_path(key)))
-            add_action(menu, "Ouvrir l'emplacement du fichier", lambda: self._run(lambda: reveal(key)), "folder")
+            add_action(menu, "Ouvrir l'emplacement du fichier", lambda: self._run(lambda: reveal_file(key)), "folder")
         else:
             bar = self.bar
             if key in bar.start_pins:
@@ -2059,7 +2117,7 @@ class StartMenu(Flyout):
                 add_action(menu, "Épingler à la barre des tâches", lambda: bar.pin("taskbar", key))
             if kind == "app":
                 menu.addSeparator()
-                add_action(menu, "Ouvrir l'emplacement du fichier", lambda: self._run(lambda: reveal(key)), "folder")
+                add_action(menu, "Ouvrir l'emplacement du fichier", lambda: self._run(lambda: reveal_file(key)), "folder")
         menu.exec(view.viewport().mapToGlobal(pos))
         menu.deleteLater()
 
@@ -2355,7 +2413,8 @@ class TaskbarSettings(QWidget):
         self.setObjectName("settings")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setWindowTitle("Paramètres de la barre des tâches")
-        self.resize(600, 640)
+        self.resize(620, 800)
+        self.setMinimumSize(560, 760)
         v = QVBoxLayout(self)
         v.setContentsMargins(36, 28, 36, 24)
         v.setSpacing(6)
@@ -2417,12 +2476,21 @@ class TaskbarSettings(QWidget):
              "Recherche locale (index Spotlight du Mac), rien ne sort de l'ordinateur", self.docs)
         self.name = Toggle(opt("show_name"))
         self.name.toggled.connect(lambda on: self._set("show_name", on))
+        self.autohide = Toggle(opt("autohide"))
+        self.autohide.toggled.connect(lambda on: self._set("autohide", on))
+        card("dock", "Masquer automatiquement la barre des tâches",
+             "Elle réapparaît quand la souris touche le bas de l'écran", self.autohide)
+        self.screens = Toggle(opt("all_screens"))
+        self.screens.toggled.connect(lambda on: self._set("all_screens", on))
+        card("display", "Afficher ma barre des tâches sur tous les écrans", "", self.screens)
         card("user", "Afficher mon nom de compte dans Démarrer",
              "À couper avant de faire des captures d'écran", self.name)
 
-        note = QLabel("Pour que les fenêtres agrandies s'arrêtent au-dessus de la barre : Réglages Système › "
-                      "Bureau et Dock › Dock en bas, masquage automatique désactivé, taille réglée pour "
-                      "qu'il fasse la hauteur de la barre.")
+        note = QLabel("Réglages du Dock (Réglages Système › Bureau et Dock) :\n"
+                      "• barre toujours visible : Dock en bas, sans masquage automatique, à la hauteur de la "
+                      "barre ; les fenêtres agrandies s'arrêtent au-dessus d'elle.\n"
+                      "• barre masquée automatiquement : Dock sur le côté, avec masquage automatique ; "
+                      "sinon il apparaît quand la barre se retire.")
         note.setObjectName("dim")
         note.setWordWrap(True)
         v.addSpacing(10)
@@ -2432,18 +2500,35 @@ class TaskbarSettings(QWidget):
         row.addStretch(1)
         quit_btn = QPushButton("Quitter la barre des tâches")
         quit_btn.setObjectName("pill")
-        quit_btn.clicked.connect(self.bar.quit_bar)
+        quit_btn.clicked.connect(quit_all)
         row.addWidget(quit_btn)
         v.addLayout(row)
 
     def _set(self, name, value):
         set_opt(name, value)
-        self.bar.apply_settings()
+        apply_all()
+
+    def sync(self):
+        """Remet chaque contrôle sur la valeur enregistrée (la fenêtre est réutilisée)."""
+        values = ((self.search_combo, {"hidden": 0, "icon": 1, "box": 2}.get(opt("search"), 2)),
+                  (self.align_combo, 0 if opt("align") == "center" else 1))
+        for combo, index in values:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+        for toggle, name in ((self.tv, "taskview"), (self.finder, "finder"), (self.docs, "docs"),
+                             (self.name, "show_name"), (self.autohide, "autohide"), (self.screens, "all_screens")):
+            toggle.blockSignals(True)
+            toggle.setChecked(opt(name))
+            toggle.blockSignals(False)
+            toggle.update()
 
     def closeEvent(self, ev):
         super().closeEvent(ev)
-        self.bar.note_self_activated()
-        self.bar.restore_focus_soon()
+        bar = main_bar()
+        if bar is not None:
+            bar.note_self_activated()
+            bar.restore_focus_soon()
 
 
 # ======================================================================================
@@ -2464,7 +2549,7 @@ def bar_geometry(screen_geo, avail_geo):
 
 
 class Bar(QWidget):
-    def __init__(self, backend=None):
+    def __init__(self, backend=None, screen=None, main=True):
         flags = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                  | Qt.WindowType.WindowDoesNotAcceptFocus | Qt.WindowType.NoDropShadowWindowHint)
         super().__init__(None, flags)
@@ -2493,11 +2578,16 @@ class Bar(QWidget):
         self._closed_at = ("", 0.0)
         self._buttons_prev = 0
         self._tick = 0
-        self.status = {"battery": None, "network": "wifi" if IS_MAC else "ethernet", "volume": None}
-        self.settings_window = None
-        self.pins = get_pins("taskbar")
-        self.start_pins = get_pins("start")
-        self.options = {k: opt(k) for k in DEFAULTS}
+        self._autohidden = False            # masquage automatique : barre retirée
+        self._edge_since = None
+        self._leave_at = None
+        self._hide_anims = []
+        self.fixed_screen = screen          # None : suit le Dock (une seule barre)
+        self.is_main = main                 # la principale porte les icônes réseau/son/batterie
+        shared = shared_state()
+        self.pins, self.start_pins = shared["pins"], shared["start_pins"]
+        self.options, self.status = shared["options"], shared["status"]
+        BARS.append(self)
         self.tip = Tip()
         self._tip_timer = QTimer(self)
         self._tip_timer.setSingleShot(True)
@@ -2520,24 +2610,28 @@ class Bar(QWidget):
         self._place_timer.timeout.connect(self.place)
         app = QGuiApplication.instance()
         app.screenAdded.connect(self._watch_screen)
-        app.screenRemoved.connect(lambda _s: self._place_timer.start())
+        app.screenRemoved.connect(self._schedule_place)
         for screen in QGuiApplication.screens():
             self._watch_screen(screen)
         self.refresh(force=True)
         self.place()
         self.read_volume()
-        self.read_status()
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(30000)
         self._status_timer.timeout.connect(self.read_status)
-        self._status_timer.start()
+        if self.is_main:
+            self.read_status()
+            self._status_timer.start()
         self._fast.start()
         self._slow.start()
 
     # --- position ---
     def _watch_screen(self, screen):
-        screen.availableGeometryChanged.connect(lambda _r: self._place_timer.start())
-        screen.geometryChanged.connect(lambda _r: self._place_timer.start())
+        screen.availableGeometryChanged.connect(self._schedule_place)
+        screen.geometryChanged.connect(self._schedule_place)
+        self._place_timer.start()
+
+    def _schedule_place(self, *_args):
         self._place_timer.start()
 
     def target_screen(self):
@@ -2550,7 +2644,7 @@ class Bar(QWidget):
         return best
 
     def place(self):
-        screen = self.target_screen()
+        screen = self.fixed_screen or self.target_screen()
         if screen is None:
             return
         rect = bar_geometry(screen.geometry(), screen.availableGeometry())
@@ -2651,7 +2745,7 @@ class Bar(QWidget):
             return
         if any(f.isVisible() for f in self._flyouts.values()):
             return
-        if self.settings_window is not None and self.settings_window.isVisible():
+        if settings_window() is not None and settings_window().isVisible():
             return
         self._self_activated = False
         if self.backend.front_pid() == self.own_pid and self.front_pid:
@@ -2680,10 +2774,11 @@ class Bar(QWidget):
         clock_w = max(fm.horizontalAdvance(t) for t in self._clock_texts()) + 24
         x -= clock_w + 4
         items.append(Item("clock", QRect(x, top, clock_w, BTN_H)))
-        tray_n = 3 if self.status.get("battery") else 2
-        tray_w = tray_n * 22 + 14
-        x -= tray_w + 4
-        items.append(Item("tray", QRect(x, top, tray_w, BTN_H)))
+        if self.is_main:                    # comme Windows : icônes système sur la barre principale
+            tray_n = 3 if self.status.get("battery") else 2
+            tray_w = tray_n * 22 + 14
+            x -= tray_w + 4
+            items.append(Item("tray", QRect(x, top, tray_w, BTN_H)))
         right_edge = x - 12
 
         fixed = [("start", BTN_W)]
@@ -2999,6 +3094,15 @@ class Bar(QWidget):
         pos = QCursor.pos()
         geo = self.geometry()
         near = geo.adjusted(0, -160, 0, 0).contains(pos)
+        if self.options.get("autohide"):
+            self.autohide_tick(pos, time.monotonic())
+        elif self._autohidden:
+            self.reveal()
+        if self._autohidden:
+            interval = 40 if near else 150
+            if self._fast.interval() != interval:
+                self._fast.setInterval(interval)
+            return
         if geo.contains(pos):
             if self.pressed is None and not self._drag:
                 self._set_hover(self.item_at(pos - geo.topLeft()))
@@ -3018,6 +3122,87 @@ class Bar(QWidget):
         interval = 40 if (near or busy or self._drag) else 150
         if self._fast.interval() != interval:
             self._fast.setInterval(interval)
+
+    # --- masquage automatique (comme le Dock) ---
+    def _keep_visible(self):
+        fly = self.flyout
+        return ((fly is not None and fly.isVisible()) or self.pressed is not None or bool(self._drag)
+                or QApplication.activePopupWidget() is not None)
+
+    def autohide_tick(self, pos, now):
+        """Appelé ~25 fois par seconde : sort la barre au bord, la range quand on s'en va."""
+        geo = self.geometry()
+        if self._autohidden:
+            at_edge = geo.left() <= pos.x() <= geo.right() and geo.bottom() - 1 <= pos.y() <= geo.bottom() + 1
+            if not at_edge:
+                self._edge_since = None
+            elif self._edge_since is None:
+                self._edge_since = now
+            elif now - self._edge_since >= 0.06:
+                self.reveal()
+            return
+        if geo.adjusted(0, -6, 0, 0).contains(pos) or self._keep_visible():
+            self._leave_at = None
+        elif self._leave_at is None:
+            self._leave_at = now
+        elif now - self._leave_at >= 0.6:
+            self.conceal()
+
+    def _stop_hide_anims(self):
+        for group in self._hide_anims:
+            group.stop()
+        self._hide_anims = []
+
+    def _slide(self, start, end, fade_from, fade_to, curve, on_done=None):
+        group = QParallelAnimationGroup(self)
+        fade = QPropertyAnimation(self, b"windowOpacity", group)
+        fade.setDuration(150)
+        fade.setStartValue(fade_from)
+        fade.setEndValue(fade_to)
+        slide = QPropertyAnimation(self, b"pos", group)
+        slide.setDuration(160)
+        slide.setStartValue(start)
+        slide.setEndValue(end)
+        slide.setEasingCurve(curve)
+        group.addAnimation(fade)
+        group.addAnimation(slide)
+        if on_done:
+            group.finished.connect(on_done)   # une fois les DEUX animations terminées
+        self._hide_anims = [group]
+        group.start()
+
+    def conceal(self):
+        if self._autohidden:
+            return
+        self._autohidden, self._leave_at, self._edge_since = True, None, None
+        self.tip.hide()
+        self._tip_timer.stop()
+        self._set_hover(None)
+        self._stop_hide_anims()
+        start = self._home = self.pos()
+
+        def done():
+            if self._autohidden:
+                self.hide()                 # cachée pour de bon : elle ne capte plus aucun clic
+                self.move(start)
+                self.setWindowOpacity(1.0)
+        # Elle s'efface sur place (Qt réapplique la dernière position après l'animation :
+        # glisser vers le bas la laisserait décalée).
+        self._slide(start, start, 1.0, 0.0, QEasingCurve.Type.InCubic, done)
+
+    def reveal(self):
+        if not self._autohidden:
+            return
+        self._autohidden, self._leave_at, self._edge_since = False, None, None
+        self._stop_hide_anims()
+        if getattr(self, "_home", None) is not None:
+            self.move(self._home)           # au cas où l'animation de sortie n'était pas finie
+        self.place()                        # et si l'écran a changé entre-temps, on se recale
+        target = self.pos()
+        self.setWindowOpacity(0.0)
+        self.move(target + QPoint(0, 12))
+        self.show()
+        self._slide(target + QPoint(0, 12), target, 0.0, 1.0, QEasingCurve.Type.OutCubic)
 
     def _poll_slow(self):
         self.refresh()
@@ -3063,7 +3248,8 @@ class Bar(QWidget):
             if key == "network" and result is None:
                 return
             self.status[key] = result
-            self.relayout()
+            for bar in list(BARS) or [self]:
+                bar.relayout()
 
     # --- actions ---
     def activate_item(self, item, new=False):
@@ -3171,14 +3357,14 @@ class Bar(QWidget):
             return
         pins.insert(len(pins) if index is None else index, key)
         set_pins(which, pins)
-        self.refresh(force=True)
+        refresh_all()
 
     def unpin(self, which, key):
         pins = self._pins(which)
         if key in pins:
             pins.remove(key)
             set_pins(which, pins)
-            self.refresh(force=True)
+            refresh_all()
 
     def move_first(self, which, key):
         pins = self._pins(which)
@@ -3194,7 +3380,7 @@ class Bar(QWidget):
             self.pins.remove(key)
             self.pins.insert(index, key)
             set_pins("taskbar", self.pins)
-        self.refresh(force=True)
+        refresh_all()
 
     @staticmethod
     def app_paths(mime):
@@ -3225,7 +3411,7 @@ class Bar(QWidget):
                 index += 1
         set_pins("taskbar", self.pins)
         ev.acceptProposedAction()
-        self.refresh(force=True)
+        refresh_all()
 
     # --- menus ---
     def _menu_above(self, item, actions, menu=None):
@@ -3334,9 +3520,10 @@ class Bar(QWidget):
         self.restore_focus_soon()
 
     def open_settings(self):
-        if self.settings_window is None:
-            self.settings_window = TaskbarSettings(self)
-        win = self.settings_window
+        if not _SETTINGS:
+            _SETTINGS.append(TaskbarSettings(self))
+        win = _SETTINGS[0]
+        win.sync()
         win.show()
         self.backend.configure_window(win, "dialog")
         self.backend.activate_self()
@@ -3345,12 +3532,7 @@ class Bar(QWidget):
         self.note_self_activated()
 
     def apply_settings(self):
-        self.options = {k: opt(k) for k in DEFAULTS}
-        self.refresh(force=True)
-        self.relayout()
-        start = self._flyouts.get("start")
-        if start:
-            start.retheme()
+        apply_all()
 
     def retheme(self):
         for key in [k for k in _ICONS if k.startswith("script:")]:
@@ -3359,20 +3541,32 @@ class Bar(QWidget):
             if hasattr(fly, "retheme"):
                 fly.retheme()
             fly.update()
-        if self.settings_window is not None:
-            self.settings_window.close()
-            self.settings_window.deleteLater()
-            self.settings_window = None
+        if _SETTINGS:
+            win = _SETTINGS.pop()
+            win.close()
+            win.deleteLater()
         self.update()
 
     def quit_bar(self):
+        quit_all()
+
+    def dispose(self):
+        """Retire cette barre (écran débranché ou réglage changé)."""
+        if self in BARS:
+            BARS.remove(self)
         self._quitting = True
+        for timer in (self._fast, self._slow, self._anim, self._place_timer, self._tip_timer, self._status_timer):
+            timer.stop()
+        self._stop_hide_anims()
         for fly in self._flyouts.values():
             fly.hide()
+            fly.deleteLater()
+        self._flyouts.clear()
+        self.flyout = None
         self.tip.hide()
-        if self.settings_window is not None:
-            self.settings_window.hide()
-        QApplication.instance().quit()
+        self.tip.deleteLater()
+        self.hide()
+        self.deleteLater()
 
     def closeEvent(self, ev):
         # Cmd+Q ne ferme pas la barre par accident : on passe par « Quitter la barre des tâches ».
@@ -3380,6 +3574,55 @@ class Bar(QWidget):
             ev.accept()
         else:
             ev.ignore()
+
+
+class Taskbars(QObject):
+    """Une barre sur chaque écran (réglage Windows « sur tous les écrans »), ou une seule."""
+
+    def __init__(self, backend):
+        super().__init__()
+        self.backend = backend
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(400)
+        self._timer.timeout.connect(self.sync)
+        app = QGuiApplication.instance()
+        app.screenAdded.connect(self._later)
+        app.screenRemoved.connect(self._removed)
+        app.primaryScreenChanged.connect(self._later)
+        self.sync()
+
+    def _later(self, *_args):
+        self._timer.start()
+
+    def _removed(self, screen):
+        # L'écran va disparaître : sa barre part tout de suite.
+        for bar in [b for b in BARS if b.fixed_screen is screen]:
+            bar.dispose()
+        self._timer.start()
+
+    @staticmethod
+    def wanted():
+        screens = QGuiApplication.screens()
+        if opt("all_screens") and len(screens) > 1:
+            primary = QGuiApplication.primaryScreen()
+            return [(s, s is primary) for s in screens]
+        return [(None, True)]                 # une barre, qui suit le Dock
+
+    def sync(self):
+        wanted = self.wanted()
+        current = [(b.fixed_screen, b.is_main) for b in BARS]
+        if len(current) == len(wanted) and all(a is c and m == n for (a, m), (c, n) in zip(current, wanted)):
+            return
+        for bar in list(BARS):
+            bar.dispose()
+        for screen, main in wanted:
+            bar = Bar(self.backend, screen, main)
+            bar.show()
+
+    def retheme(self):
+        for bar in list(BARS):
+            bar.retheme()
 
 
 # ======================================================================================
@@ -3417,13 +3660,12 @@ def main():
     if problems:
         print("[verrou] arrêt, bibliothèques réseau présentes : " + ", ".join(problems), file=sys.stderr)
         return 3
-    bar = Bar(NATIVE)
-    bar.show()
+    MANAGER.append(Taskbars(NATIVE))
 
     def on_scheme(*_args):
         Theme.detect()
         apply_theme(app)
-        bar.retheme()
+        MANAGER[0].retheme()
     try:
         app.styleHints().colorSchemeChanged.connect(on_scheme)
     except AttributeError:

@@ -29,7 +29,7 @@ import time
 import unicodedata
 
 APP_NAME = "Bloc-notes Pro"
-VERSION = "1.0"          # à augmenter à chaque modification
+VERSION = "1.1"          # à augmenter à chaque modification
 VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
 IS_MAC = sys.platform == "darwin"
@@ -674,7 +674,79 @@ def unescape_extended(s):
     return "".join(out)
 
 
-def build_pattern(find, mode="normal", case=False, word=False, dotall=False):
+# Caractères qui ressemblent à un tiret, une espace, une apostrophe ou un guillemet ordinaires.
+# Fréquents dans un texte copié depuis Outlook, Teams, Word, un PDF ou une page web.
+DASH_LIKE = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe58\ufe63\uff0d"
+SPACE_LIKE = " \u00a0\u202f\u2007\u2009\u200a\u2002\u2003\u2004\u2005\u2006\u2008\u3000"
+APOS_LIKE = "'\u2018\u2019\u201a\u201b\u2032\u02bc"
+QUOTE_LIKE = '"\u201c\u201d\u201e\u201f\u2033'
+INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff\u00ad"
+LOOKALIKE_GROUPS = (DASH_LIKE, SPACE_LIKE, APOS_LIKE, QUOTE_LIKE)
+LOOKALIKE_NAMES = {
+    "\u2010": "trait d'union typographique", "\u2011": "trait d'union insécable", "\u2012": "tiret numérique",
+    "\u2013": "tiret moyen", "\u2014": "tiret long", "\u2015": "barre horizontale", "\u2212": "signe moins",
+    "\ufe58": "petit tiret", "\ufe63": "petit trait d'union", "\uff0d": "tiret pleine largeur",
+    "\u00a0": "espace insécable", "\u202f": "espace fine insécable", "\u2007": "espace de chiffre",
+    "\u2009": "espace fine", "\u200a": "espace ultra-fine", "\u3000": "espace idéographique",
+    "\u2018": "apostrophe ouvrante", "\u2019": "apostrophe typographique", "\u201a": "apostrophe basse",
+    "\u2032": "prime", "\u02bc": "apostrophe modificative", "\u201c": "guillemet anglais ouvrant",
+    "\u201d": "guillemet anglais fermant", "\u201e": "guillemet bas", "\u2033": "double prime",
+    "\u200b": "espace invisible", "\u200c": "antiliant invisible", "\u200d": "liant invisible",
+    "\u2060": "gluon invisible", "\ufeff": "BOM invisible", "\u00ad": "trait d'union conditionnel invisible",
+}
+ASCII_OF = {c: g[0] for g in LOOKALIKE_GROUPS for c in g[1:]}
+
+
+def describe_special(c):
+    """« ‑ » trait d'union insécable (U+2011)"""
+    name = LOOKALIKE_NAMES.get(c) or unicodedata.name(c, "caractère spécial").lower()
+    shown = "" if c in INVISIBLE or c in SPACE_LIKE else f"« {c} » "
+    return f"{shown}{name} (U+{ord(c):04X})"
+
+
+def lookalike_source(literal):
+    """Motif qui trouve le texte même écrit avec des tirets/espaces/apostrophes « qui ressemblent »
+    et des caractères invisibles glissés au milieu."""
+    inv = "[" + INVISIBLE + "]*"
+    parts = []
+    for c in literal:
+        if c in INVISIBLE:
+            continue
+        group = next((g for g in LOOKALIKE_GROUPS if c in g), None)
+        parts.append("[" + re.escape(group) + "]" if group else re.escape(c))
+    return inv.join(parts)
+
+
+def to_plain_typo(text):
+    """Tirets, espaces, apostrophes et guillemets typographiques → leur version clavier ; invisibles supprimés."""
+    count = sum(1 for c in text if c in ASCII_OF or c in INVISIBLE)
+    out = "".join(ASCII_OF.get(c, c) for c in text if c not in INVISIBLE)
+    return out, count
+
+
+def lookalike_hint(texts, find, mode, case=False, word=False, dotall=False, limit=100000):
+    """Une recherche ne trouve rien : la trouverait-on avec des caractères « qui ressemblent » ?
+    → (nombre d'occurrences, [caractères différents rencontrés]) ou None."""
+    if mode == "regex" or not find:
+        return None
+    try:
+        pat = build_pattern(find, mode, case, word, dotall, lookalike=True)
+    except ValueError:
+        return None
+    literal = unescape_extended(find) if mode == "extended" else find
+    n, odd = 0, []
+    for text in texts:
+        for m in pat.finditer(text):
+            n += 1
+            for c in m.group():
+                if c not in literal and c not in odd and (c in INVISIBLE or c in ASCII_OF):
+                    odd.append(c)
+            if n >= limit:
+                break
+    return (n, odd) if n and odd else None
+
+
+def build_pattern(find, mode="normal", case=False, word=False, dotall=False, lookalike=False):
     if not find:
         raise ValueError("rien à rechercher")
     lead, exact = "", False
@@ -683,7 +755,8 @@ def build_pattern(find, mode="normal", case=False, word=False, dotall=False):
         lead, src = split_global_flags(converted)
         exact = converted == find           # positions d'erreur fiables dans le texte tapé
     else:
-        src = re.escape(unescape_extended(find) if mode == "extended" else find)
+        literal = unescape_extended(find) if mode == "extended" else find
+        src = (lookalike_source(literal) if lookalike else "") or re.escape(literal)
     prefix = f"(?{lead})" if lead else ""
     body_at = len(prefix)
     if word:
@@ -4029,6 +4102,13 @@ class FindDialog(QDialog):
         for w in (self.m_normal, self.m_ext, self.m_regex, self.dotall):
             ml.addWidget(w)
         col2.addWidget(mode_box)
+        self.alike = QCheckBox("Tirets, espaces et apostrophes similaires")
+        self.alike.setToolTip("Trouve aussi « pf-be » écrit avec un tiret long ou insécable (– — ‑ −), une espace "
+                              "insécable,\nune apostrophe typographique (’) ou des caractères invisibles : "
+                              "fréquent dans un texte copié depuis\nOutlook, Teams, Word, un PDF ou une page web. "
+                              "Sans effet en mode « Expression régulière ».")
+        self.m_regex.toggled.connect(lambda on: self.alike.setEnabled(not on))
+        col2.addWidget(self.alike)
         col2.addStretch(1)
         opts.addLayout(col1)
         opts.addLayout(col2)
@@ -4150,10 +4230,24 @@ class FindDialog(QDialog):
         self._remember(self.find_edit, "history_find")
         try:
             return build_pattern(self.find_edit.currentText(), self.mode(), self.case.isChecked(),
-                                 self.word.isChecked(), self.dotall.isChecked())
+                                 self.word.isChecked(), self.dotall.isChecked(),
+                                 lookalike=self.alike.isChecked() and self.mode() != "regex")
         except ValueError as exc:
             self.say(str(exc).capitalize(), error=True)
             return None
+
+    def _alike_hint(self, editors):
+        """Rien trouvé : y a-t-il le même texte écrit avec un tiret/espace/apostrophe « qui ressemble » ?"""
+        if self.alike.isChecked():
+            return ""
+        h = lookalike_hint([ed.text() for ed in editors if ed is not None], self.find_edit.currentText(),
+                           self.mode(), self.case.isChecked(), self.word.isChecked(), self.dotall.isChecked())
+        if not h:
+            return ""
+        n, odd = h
+        chars = ", ".join(describe_special(c) for c in odd[:3]) + (" …" if len(odd) > 3 else "")
+        return (f" Mais {n} occurrence{'s' if n > 1 else ''} avec un caractère qui ressemble : {chars}. "
+                "Coche « Tirets, espaces et apostrophes similaires ».")
 
     def say(self, text, error=False, ok=False):
         color = "#C42B1C" if error else ("#0F7B0F" if ok else "")
@@ -4190,7 +4284,7 @@ class FindDialog(QDialog):
                     m = m2
                 wrapped = m is not None
         if m is None:
-            self.say(f"Introuvable : « {self.find_edit.currentText()} »", error=True)
+            self.say(f"Introuvable : « {self.find_edit.currentText()} ».{self._alike_hint([ed])}", error=True)
             QApplication.beep()
             return False
         ed.select_range(pm.to_doc(m.start()), pm.to_doc(m.end()))
@@ -4210,7 +4304,8 @@ class FindDialog(QDialog):
             return
         text = ed.text()
         n = sum(1 for _ in pattern.finditer(text))
-        self.say(f"Compter : {n} occurrence{'s' if n > 1 else ''}.", ok=n > 0, error=n == 0)
+        self.say(f"Compter : {n} occurrence{'s' if n > 1 else ''}." + ("" if n else self._alike_hint([ed])),
+                 ok=n > 0, error=n == 0)
 
     def find_all(self, all_docs):
         pattern = self.pattern()
@@ -4230,7 +4325,8 @@ class FindDialog(QDialog):
                 files += 1
         top.setText(0, f"Rechercher « {self.find_edit.currentText()} » ({total} résultat{'s' if total > 1 else ''} "
                        f"dans {files} document{'s' if files > 1 else ''})")
-        self.say(f"{total} résultat(s) dans {files} document(s).", ok=total > 0, error=total == 0)
+        self.say(f"{total} résultat(s) dans {files} document(s)." + ("" if total else self._alike_hint(editors)),
+                 ok=total > 0, error=total == 0)
 
     def replace_one(self):
         ed, pattern = self.win.current(), self.pattern()
@@ -4276,7 +4372,8 @@ class FindDialog(QDialog):
                 total += n
                 docs += 1
         self.say(f"Remplacer tout : {total} occurrence{'s' if total > 1 else ''} remplacée{'s' if total > 1 else ''}"
-                 + (f" dans {docs} document(s)." if all_docs else "."), ok=total > 0, error=total == 0)
+                 + (f" dans {docs} document(s)." if all_docs else ".")
+                 + ("" if total else self._alike_hint(editors)), ok=total > 0, error=total == 0)
 
     def _replace_in_editor(self, ed, pattern, repl, use_sel=True):
         text = ed.text()
@@ -4312,7 +4409,8 @@ class FindDialog(QDialog):
         spans = [(pm.to_doc(m.start()), pm.to_doc(m.end())) for m in pattern.finditer(text, a, b) if m.end() > m.start()]
         ed.add_marks(spans, self.bookmark.isChecked())
         n = len(spans)
-        self.say(f"Marquer : {n} occurrence{'s' if n > 1 else ''} marquée{'s' if n > 1 else ''}.", ok=n > 0, error=n == 0)
+        self.say(f"Marquer : {n} occurrence{'s' if n > 1 else ''} marquée{'s' if n > 1 else ''}."
+                 + ("" if n else self._alike_hint([ed])), ok=n > 0, error=n == 0)
 
     def clear_marks(self):
         ed = self.win.current()
@@ -5784,6 +5882,7 @@ class MainWindow(QMainWindow):
         a["sp2tabs"] = A("Espaces de début → tabulations", E(lambda ed: self.lines_op(
             ed, lambda ls: [leading_to_tabs(l, ed.tab_width) for l in ls], "Espaces → tabulations")))
         a["special"] = A("Remplacer les caractères invisibles (NBSP, ZWSP…)", E(self.clean_special))
+        a["typo"] = A("Remplacer tirets, apostrophes et guillemets typographiques (– ’ “…)", E(self.clean_typo))
         a["comment"] = A("Basculer le commentaire", E(lambda ed: self.comment(ed, "toggle")),
                          sc("Ctrl+Q", ["Ctrl+/", "Meta+Q"]))
         a["comment_add"] = A("Commenter", E(lambda ed: self.comment(ed, "add")), sc("Ctrl+K"))
@@ -5886,7 +5985,7 @@ class MainWindow(QMainWindow):
         menu("Opérations sur les lignes", ["dup", "delline", "up", "down", "join", "-"] + self.line_ops[:5]
              + ["-"] + self.line_ops[5:9], e)
         menu("Commentaires", ["comment", "comment_add", "comment_del"], e)
-        menu("Blancs", self.line_ops[9:] + ["-", "tabs2sp", "sp2tabs", "-", "special"], e)
+        menu("Blancs", self.line_ops[9:] + ["-", "tabs2sp", "sp2tabs", "-", "special", "typo"], e)
         e.addSeparator()
         e.addAction(a["coleditor"])
         hint = e.addAction("Sélection en colonne : Option (Alt) + glisser, ou Option+Maj+flèches")
@@ -6879,6 +6978,17 @@ class MainWindow(QMainWindow):
         if count:
             ed.replace_range(start, end, new, select=_sel)
         self.say(f"{count} caractère(s) invisible(s) remplacé(s)." if count else "Aucun caractère invisible trouvé.")
+
+    def clean_typo(self, ed):
+        """Texte copié d'Outlook, Teams, Word… : – — ‑ − → -, ’ → ', “ ” → ", espaces spéciales → espace."""
+        if ed.isReadOnly():
+            return
+        start, end, text, _sel = self._target(ed)
+        new, count = to_plain_typo(text)
+        if count:
+            ed.replace_range(start, end, new, select=_sel)
+        self.say(f"{count} caractère(s) typographique(s) remplacé(s) par leur version clavier." if count
+                 else "Aucun tiret, apostrophe ou guillemet typographique trouvé.")
 
     def clear_bookmarks(self, ed):
         ed.bookmarks = []

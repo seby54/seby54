@@ -84,7 +84,7 @@ IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
 _P = os.path   # module de chemins (remplaçable dans les tests)
 APP_NAME = "Explorateur"
-VERSION = "1.0"          # à augmenter à chaque modification
+VERSION = "1.1"          # à augmenter à chaque modification
 VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
 
@@ -383,6 +383,11 @@ def vscode_path():
 
 
 ANNOTATE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+# Applications du Mac proposées dans « Ouvrir avec » (nom, emplacement, extensions ; None = tout fichier)
+MAC_OPEN_WITH = (
+    ("TextEdit", "/System/Applications/TextEdit.app", None),
+    ("Aperçu", "/System/Applications/Preview.app", ANNOTATE_EXTS | {".pdf", ".heic", ".svg"}),
+)
 
 
 def annoter_script():
@@ -3323,6 +3328,7 @@ class MainWindow(QMainWindow):
                                ["Ctrl+Shift+C", "Ctrl+Alt+C"], "copy")
         self.act_open = A("Ouvrir", self.open_selection, ["Ctrl+O", "Ctrl+Down"])
         self.act_open_with = A("Ouvrir avec…", self.open_with, (), "openwith")
+        self.act_blocnotes = A("Ouvrir avec Bloc-notes Pro", self.blocnotes_selection, (), "notepad")
         self.act_quicklook = A("Aperçu (Quick Look)", self.quick_look, ["Ctrl+Y"])
         self.act_properties = A("Propriétés", self.properties, ["Alt+Return", "Ctrl+I"], "wrench")
         self.act_compress = A("Compresser en fichier ZIP", self.compress_selection, (), "zip")
@@ -3556,7 +3562,8 @@ class MainWindow(QMainWindow):
         m.addAction(self.act_new_text)
         m.addAction(self.act_new_zip)
         m.addSeparator()
-        for act in (self.act_open, self.act_open_with, self.act_quicklook, self.act_properties):
+        for act in (self.act_open, self.act_open_with, self.act_blocnotes, self.act_quicklook,
+                    self.act_properties):
             m.addAction(act)
         m = bar.addMenu("Édition")
         for act in (self.act_cut, self.act_copy, self.act_paste, self.act_paste_move, None,
@@ -3743,6 +3750,8 @@ class MainWindow(QMainWindow):
             act.setEnabled(has_dir)
         self.btn_new.setEnabled(has_dir)
         self.act_extract.setEnabled(any(ext_of(p) == ".zip" for p in sel))
+        self.act_blocnotes.setEnabled(bool(blocnotes_script()) and any(
+            p not in SPECIAL_LOCS and os.path.isfile(p) for p in sel))
         self.act_copy_path.setEnabled(bool(sel) or has_dir)
 
     def focus_content(self):
@@ -3890,6 +3899,33 @@ class MainWindow(QMainWindow):
         script = annoter_script()
         for path in [p for p in paths if ext_of(p) in ANNOTATE_EXTS][:5]:
             detached(sys.executable, [script, path])
+
+    def blocnotes_selection(self):
+        self.edit_in_blocnotes(self.targets())
+
+    def _open_with_menu(self, menu, paths, single):
+        """Sous-menu « Ouvrir avec » façon Windows 11 : tes outils, quelques applis du Mac, puis le choix libre."""
+        files = [p for p in paths if p and p not in SPECIAL_LOCS and os.path.isfile(p)]
+        sub = menu.addMenu(Icons.get("openwith"), "Ouvrir avec")
+        if files:
+            if blocnotes_script():
+                menu_item(sub, "Bloc-notes Pro", lambda: self.edit_in_blocnotes(files), icon="notepad")
+            else:
+                menu_item(sub, "Bloc-notes Pro (blocnotes.py absent du dossier de l'explorateur)", lambda: None,
+                          icon="notepad", enabled=False)
+        if vscode_path():
+            menu_item(sub, "Visual Studio Code", lambda: self.open_in_vscode(paths), icon="code")
+        if annoter_script() and any(ext_of(p) in ANNOTATE_EXTS for p in files):
+            menu_item(sub, "Annoteur", lambda: self.annotate(files), icon="annotate")
+        if IS_MAC and files:
+            for name, app, exts in MAC_OPEN_WITH:
+                if os.path.isdir(app) and (exts is None or all(ext_of(p) in exts for p in files)):
+                    menu_item(sub, name, lambda a=app: detached("open", ["-a", a] + files),
+                              icon=self.icons.icon(QFileInfo(app)))
+        if IS_MAC or (IS_WIN and single):
+            sub.addSeparator()
+            menu_item(sub, "Choisir une autre application…", self.open_with)
+        return sub
 
     def edit_in_blocnotes(self, paths):
         script = blocnotes_script()
@@ -4353,8 +4389,8 @@ class MainWindow(QMainWindow):
         if folder:
             menu_item(menu, "Ouvrir dans un nouvel onglet", lambda: self.add_tab(folder, activate=False))
             menu_item(menu, "Ouvrir dans une nouvelle fenêtre", lambda: self.new_window(folder))
-        elif IS_MAC or (IS_WIN and single):
-            menu_item(menu, "Ouvrir avec…", self.open_with)
+        else:
+            self._open_with_menu(menu, paths, single)
         if IS_MAC and not folder:
             menu_item(menu, "Aperçu", self.quick_look, shortcut="Espace")
         if vscode_path():

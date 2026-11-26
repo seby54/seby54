@@ -35,7 +35,7 @@ from functools import lru_cache
 
 APP_NAME = "Terminal Pro"
 ORG_NAME = "explorateur-maison"
-VERSION = "1.2"          # à augmenter à chaque modification
+VERSION = "1.3"          # à augmenter à chaque modification
 VERSION_DATE = "26/11/2026"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1445,6 +1445,30 @@ class Screen:
             r -= 1
         return "".join(reversed(parts))
 
+    def line_above_text(self, max_rows=8):
+        """Ligne complète juste au-dessus de la ligne du curseur (lignes coupées recollées).
+        Sert quand une passerelle termine sa question par un retour à la ligne :
+        « …for this operation:⏎ » laisse le curseur au début d'une ligne vide."""
+        r = self.history_total + self.cy
+        while True:                                   # début de la ligne du curseur
+            prev = self.line_at(r - 1)
+            if prev is None or not prev.wrapped:
+                break
+            r -= 1
+        end = r - 1
+        line = self.line_at(end)
+        if line is None:
+            return ""
+        parts = ["".join(line.chars[:self.cols])]
+        r = end - 1
+        while len(parts) < max_rows:
+            prev = self.line_at(r)
+            if prev is None or not prev.wrapped:
+                break
+            parts.append("".join(prev.chars[:self.cols]))
+            r -= 1
+        return "".join(reversed(parts)).rstrip()
+
     def display_text(self):
         return "\n".join(line.text() for line in self.lines)
 
@@ -2275,6 +2299,8 @@ class Session(QObject):
         self._reap.setInterval(40)
         self._reap.timeout.connect(self._check_exit)
         self._reason = None                  # envoi de la raison en cours (vérifié lettre par lettre)
+        self.trace = deque(maxlen=60)   # diagnostic : ce que le terminal a vu (jamais tes frappes)
+        self._last_trace = None
         self._last_output = 0.0
         self._reason_timer = QTimer(self)
         self._reason_timer.setInterval(50)
@@ -2394,11 +2420,25 @@ class Session(QObject):
             self.pty.resize(cols, rows)
 
     # ---- réponses automatiques
+    def _trace(self, text):
+        if text != self._last_trace:
+            self._last_trace = text
+            self.trace.append(f"{time.monotonic() - self.started_at:7.1f} s  {text}")
+
+    def _question_text(self, rule, prompt=None):
+        """Où chercher la question d'une règle : la ligne du curseur, ou — pour la raison PSM seulement —
+        la ligne du dessus quand la passerelle est passée à la ligne après sa question."""
+        prompt = self.screen.prompt_text() if prompt is None else prompt
+        if prompt.strip():
+            return prompt
+        return self.screen.line_above_text() if rule.label == "raison PSM" else ""
+
     def _check_rules(self):
         if not self.rules:
             return
         prompt = self.screen.prompt_text()
-        if not prompt.strip():
+        above = "" if prompt.strip() else self.screen.line_above_text()
+        if not prompt.strip() and not above:
             return
         window = float(self.settings.get("autoWindow", 180) or 180)
         now = time.monotonic()
@@ -2408,11 +2448,19 @@ class Session(QObject):
         in_auth = modes is not None and modes[1]
         in_phase = in_auth or now < max(self.started_at + window, self._phase_until)
         key = (self.screen.history_total + self.screen.cy, prompt)
+        if in_phase:
+            mode = "illisible" if modes is None else ("écho " + ("oui" if modes[0] else "non") + ", mode "
+                                                      + ("ligne" if modes[1] else "brut"))
+            if prompt.strip():
+                self._trace(f"écran : « {prompt[-90:]} » — terminal : {mode}")
+            else:
+                self._trace(f"écran (curseur passé à la ligne) : « {above[-80:]} » — terminal : {mode}")
         for rule in self.rules:
             if (rule.once and rule.fired) or (rule.connection_phase and not in_phase):
                 continue
-            if not rule.regex.search(prompt):
+            if not rule.regex.search(self._question_text(rule, prompt)):
                 continue
+            self._trace(f"→ reconnu : {rule.label}")
             if rule.kind == "notify":
                 self._phase_until = now + window       # tu cherches ton jeton : on attend la raison plus longtemps
                 if key != self._last_notice:
@@ -2447,6 +2495,7 @@ class Session(QObject):
         self._reason = None
         self._reason_timer.stop()
         if kind:
+            self._trace(f"raison : {message}")
             self.notify.emit(kind, message)
 
     def user_typed(self):
@@ -2470,8 +2519,9 @@ class Session(QObject):
                     job["rule"].fired = False
                     self._end_reason("error", "Le serveur écrit sans arrêt : raison non envoyée, tape-la toi-même.")
                 return
-            if not job["rule"].regex.search(s.prompt_text()):
+            if not job["rule"].regex.search(self._question_text(job["rule"])):
                 job["rule"].fired = False                 # la question a disparu : rien n'a été tapé
+                self._trace("raison : la question a disparu avant l'envoi, rien n'a été tapé")
                 self._end_reason()
                 return
             modes = self.pty.tty_modes() if self.pty is not None else None
@@ -5535,6 +5585,7 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(glyph_icon("settings", UI["text"]), "Paramètres", self.open_settings)
         m.addAction("Raccourcis clavier", self.show_shortcuts)
+        m.addAction("Diagnostic de la raison PSM…", self.show_reason_trace)
         m.addAction(f"À propos de {APP_NAME} ({VERSION})", self.show_about)
         m.exec(self.menu_btn.mapToGlobal(QPoint(0, self.menu_btn.height())))
 
@@ -5618,6 +5669,30 @@ class MainWindow(QMainWindow):
             self.config.save()
         except OSError as exc:
             QMessageBox.warning(self, APP_NAME, f"Enregistrement impossible : {exc}")
+
+    def show_reason_trace(self):
+        """Ce que le terminal a vu pendant la connexion de l'onglet actif (jamais tes frappes) :
+        à photographier si la raison n'est pas tapée."""
+        view = self.active_view()
+        sess = view.session if view is not None else None
+        lines = list(sess.trace) if sess is not None else []
+        head = [f"{APP_NAME} {VERSION} — onglet « {sess.title if sess else '?'} »",
+                f"Raison prévue : « {next((r.response for r in sess.rules if r.label == 'raison PSM'), '') or 'aucune'} »"
+                if sess is not None and sess.rules else "Pas une connexion PSMP (aucune règle).", ""]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Diagnostic de la raison PSM")
+        dlg.resize(900, 460)
+        lay = QVBoxLayout(dlg)
+        box = QPlainTextEdit("\n".join(head + (lines or ["(rien de noté pendant la connexion)"])))
+        box.setReadOnly(True)
+        box.setStyleSheet(f"font-family: '{mono_font('', 12).family()}'; font-size: 12px;")
+        lay.addWidget(box, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        copy = bb.addButton("Copier", QDialogButtonBox.ButtonRole.ActionRole)
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(box.toPlainText()))
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        dlg.exec()
 
     def show_shortcuts(self):
         if IS_MAC:

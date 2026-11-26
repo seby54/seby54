@@ -35,7 +35,7 @@ from functools import lru_cache
 
 APP_NAME = "Terminal Pro"
 ORG_NAME = "explorateur-maison"
-VERSION = "1.1"          # à augmenter à chaque modification
+VERSION = "1.2"          # à augmenter à chaque modification
 VERSION_DATE = "26/11/2026"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1430,11 +1430,20 @@ class Screen:
             out.append(part)
         return "".join(out)
 
-    def prompt_text(self):
-        """Ce qui est écrit sur la ligne du curseur, avant lui (pour les réponses automatiques)."""
+    def prompt_text(self, max_rows=8):
+        """Ce qui est écrit avant le curseur sur la ligne en cours (pour les réponses automatiques).
+        Une invite trop longue pour la fenêtre est coupée sur plusieurs lignes : on la recolle."""
         line = self.lines[self.cy]
         end = self.cols if self.wrap_pending else self.cx
-        return "".join(line.chars[:end])
+        parts = ["".join(line.chars[:end])]
+        r = self.history_total + self.cy - 1
+        while len(parts) < max_rows:
+            prev = self.line_at(r)
+            if prev is None or not prev.wrapped:
+                break
+            parts.append("".join(prev.chars[:self.cols]))
+            r -= 1
+        return "".join(reversed(parts))
 
     def display_text(self):
         return "\n".join(line.text() for line in self.lines)
@@ -1552,6 +1561,21 @@ class Pty:
     def resize(self, cols, rows):
         if self.fd >= 0:
             _set_size(self.fd, cols, rows)
+
+    def tty_modes(self):
+        """(écho, mode ligne, touche « effacer la ligne ») du terminal du programme, ou None si illisible.
+        Écho coupé + mode ligne = saisie masquée, comme un mot de passe (c'est ce que regardent iTerm et
+        Terminal pour afficher la clé). ssh repasse en mode brut une fois connecté."""
+        if self.fd < 0:
+            return None
+        try:
+            attrs = termios.tcgetattr(self.fd)
+        except (termios.error, OSError):
+            return None
+        lflag, kill = attrs[3], attrs[6][termios.VKILL]
+        if not isinstance(kill, bytes) or kill in (b"\x00", b"\xff"):
+            kill = b""
+        return bool(lflag & termios.ECHO), bool(lflag & termios.ICANON), kill
 
     def poll(self):
         if self.exit_code is not None:
@@ -2378,7 +2402,11 @@ class Session(QObject):
             return
         window = float(self.settings.get("autoWindow", 180) or 180)
         now = time.monotonic()
-        in_phase = now < max(self.started_at + window, self._phase_until)
+        modes = self.pty.tty_modes() if self.pty is not None else None
+        # ssh reste en mode ligne pendant toute l'authentification (clé de la passerelle, PIN, raison),
+        # même si tu mets dix minutes à vérifier une empreinte ; il passe en mode brut une fois connecté.
+        in_auth = modes is not None and modes[1]
+        in_phase = in_auth or now < max(self.started_at + window, self._phase_until)
         key = (self.screen.history_total + self.screen.cy, prompt)
         for rule in self.rules:
             if (rule.once and rule.fired) or (rule.connection_phase and not in_phase):
@@ -2446,6 +2474,14 @@ class Session(QObject):
                 job["rule"].fired = False                 # la question a disparu : rien n'a été tapé
                 self._end_reason()
                 return
+            modes = self.pty.tty_modes() if self.pty is not None else None
+            if modes is not None and not modes[0] and modes[1]:
+                # La passerelle masque la saisie, comme pour un mot de passe : rien ne s'affichera jamais.
+                # On efface d'abord la ligne (au cas où), puis la raison exacte et Entrée d'un seul envoi.
+                self.write(modes[2] + target.encode("utf-8") + b"\r")
+                self._end_reason("reason", f"Raison PSM envoyée : « {target} » (saisie masquée par la passerelle, "
+                                           "comme un mot de passe)")
+                return
             job["start"] = (s.history_total + s.cy, s.cols if s.wrap_pending else s.cx)
             job["stage"] = "echo"
             job["deadline"] = now + 4.0
@@ -2460,8 +2496,14 @@ class Session(QObject):
                                       "validé. Corrige la ligne puis appuie sur Entrée.")
         elif now > job["deadline"]:
             if not shown:
-                self._end_reason("warn", "Raison tapée, mais le serveur ne l'affiche pas : impossible de la "
-                                         "vérifier. Appuie sur Entrée si tu es sûr, sinon efface-la.")
+                modes = self.pty.tty_modes() if self.pty is not None else None
+                if modes is not None and modes[1] and modes[2]:
+                    self.write(modes[2])                        # ligne vidée : rien de caché ne reste
+                    self._end_reason("warn", "Le serveur n'affiche pas la raison : rien n'a été validé et la "
+                                             "ligne a été vidée. Tape la raison toi-même puis Entrée.")
+                else:
+                    self._end_reason("warn", "Raison tapée, mais le serveur ne l'affiche pas : impossible de la "
+                                             "vérifier. Appuie sur Entrée si tu es sûr, sinon efface-la.")
             else:
                 self._end_reason("error", f"Raison incomplète à l'écran (« {shown} ») : rien n'a été validé. "
                                           "Corrige la ligne puis appuie sur Entrée.")
@@ -5450,7 +5492,7 @@ class MainWindow(QMainWindow):
         lines = [f"→ {plan.display}"]
         if plan.psmp:
             lines.append("→ PIN + code RSA : à toi de les taper quand ils sont demandés")
-            lines.append(f"→ raison PSM tapée puis vérifiée à l'écran avant Entrée : « {reason} »")
+            lines.append(f"→ raison PSM tapée automatiquement (vérifiée à l'écran si la passerelle l'affiche) : « {reason} »")
         banner = "\x1b[90m" + "\r\n".join(lines) + "\x1b[0m\r\n"
         settings = st
         spec = LaunchSpec(node.get("name") or plan.target, plan.argv, "ssh", os.path.expanduser("~"), "ssh",

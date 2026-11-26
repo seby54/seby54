@@ -35,7 +35,7 @@ from functools import lru_cache
 
 APP_NAME = "Terminal Pro"
 ORG_NAME = "explorateur-maison"
-VERSION = "1.3"          # à augmenter à chaque modification
+VERSION = "1.4"          # à augmenter à chaque modification
 VERSION_DATE = "26/11/2026"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +49,41 @@ def version_details():
     except ImportError:
         qt = "absent"
     return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
+
+
+EMPREINTE = "fa4947959a43aeb6"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
+
+
+def empreinte_fichier(path):
+    """Empreinte d'un script (fins de ligne normalisées, ligne EMPREINTE vidée) ; None si illisible."""
+    import hashlib
+    import re as _re
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    text = text.replace("\r\n", "\n")
+    text = _re.sub(r'^EMPREINTE = "[0-9a-f]*"', 'EMPREINTE = ""', text, count=1, flags=_re.M)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def fichier_intact():
+    """True : tel que livré ; False : modifié ou abîmé pendant la copie ; None : impossible à dire."""
+    if not EMPREINTE:
+        return None
+    got = empreinte_fichier(os.path.abspath(__file__))
+    return None if got is None else got == EMPREINTE
+
+
+def avertir_si_abime():
+    if fichier_intact() is False:
+        from PySide6.QtWidgets import QMessageBox
+        name = os.path.basename(os.path.abspath(__file__))
+        QMessageBox.warning(None, APP_NAME, f"Le fichier {name} n'est pas tel qu'il a été livré : il a été modifié "
+                                            "ou abîmé pendant sa copie (caractères disparus, fichier coupé…).\n\n"
+                                            "Certaines fonctions peuvent mal marcher. Récupère-le en téléchargeant "
+                                            "la pièce jointe telle quelle, sans copier-coller son contenu.")
 
 
 def explorer_script():
@@ -5760,7 +5795,9 @@ def verifier_pyside():
 
 def main():
     if "--version" in sys.argv[1:]:
-        print(f"{APP_NAME} {VERSION} du {VERSION_DATE}")
+        etat = {True: "fichier intact", False: "FICHIER MODIFIÉ OU ABÎMÉ : à retélécharger",
+                None: "fichier non vérifié"}[fichier_intact()]
+        print(f"{APP_NAME} {VERSION} du {VERSION_DATE} — {etat}")
         return 0
     verifier_pyside()
     if not (sys.platform == "darwin" or sys.platform.startswith("linux")):
@@ -5797,6 +5834,7 @@ def main():
     problems = controle_reseau()
     if problems:
         QMessageBox.critical(win, APP_NAME, "Le verrou a détecté un module interdit :\n" + "\n".join(problems))
+    QTimer.singleShot(500, avertir_si_abime)
     return app.exec()
 
 

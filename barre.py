@@ -29,7 +29,7 @@ import time
 import unicodedata
 
 APP_NAME = "Barre des tâches"
-VERSION = "1.0"          # à augmenter à chaque modification
+VERSION = "1.1"          # à augmenter à chaque modification
 VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
 IS_MAC = sys.platform == "darwin"
@@ -45,6 +45,41 @@ def version_details():
     except ImportError:
         qt = "absent"
     return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
+
+
+EMPREINTE = "209cdcc52b1e7072"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
+
+
+def empreinte_fichier(path):
+    """Empreinte d'un script (fins de ligne normalisées, ligne EMPREINTE vidée) ; None si illisible."""
+    import hashlib
+    import re as _re
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    text = text.replace("\r\n", "\n")
+    text = _re.sub(r'^EMPREINTE = "[0-9a-f]*"', 'EMPREINTE = ""', text, count=1, flags=_re.M)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def fichier_intact():
+    """True : tel que livré ; False : modifié ou abîmé pendant la copie ; None : impossible à dire."""
+    if not EMPREINTE:
+        return None
+    got = empreinte_fichier(os.path.abspath(__file__))
+    return None if got is None else got == EMPREINTE
+
+
+def avertir_si_abime():
+    if fichier_intact() is False:
+        from PySide6.QtWidgets import QMessageBox
+        name = os.path.basename(os.path.abspath(__file__))
+        QMessageBox.warning(None, APP_NAME, f"Le fichier {name} n'est pas tel qu'il a été livré : il a été modifié "
+                                            "ou abîmé pendant sa copie (caractères disparus, fichier coupé…).\n\n"
+                                            "Certaines fonctions peuvent mal marcher. Récupère-le en téléchargeant "
+                                            "la pièce jointe telle quelle, sans copier-coller son contenu.")
 
 # Toujours le chemin complet : un programme du même nom posé ailleurs ne peut pas
 # être lancé à la place du vrai.
@@ -87,6 +122,7 @@ def script_path(key):
 
 _VERSION_RE = re.compile(r'^VERSION\s*=\s*"([^"\n]{1,20})"', re.M)
 _DATE_RE = re.compile(r'^VERSION_DATE\s*=\s*"([^"\n]{1,20})"', re.M)
+_EMPREINTE_RE = re.compile(r'^EMPREINTE = "([0-9a-f]*)"', re.M)
 
 
 def script_version(path):
@@ -100,16 +136,32 @@ def script_version(path):
     return (v.group(1) if v else ""), (d.group(1) if d else "")
 
 
+def script_intact(path):
+    """True / False (abîmé ou modifié) / None (pas d'empreinte dans le fichier)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            m = _EMPREINTE_RE.search(f.read(30000))
+    except OSError:
+        return None
+    if not m or not m.group(1):
+        return None
+    return empreinte_fichier(path) == m.group(1)
+
+
 def versions_text():
-    """Une ligne par outil : utile pour voir d'un coup ce qui est à mettre à jour."""
-    lines = [f"{APP_NAME} {VERSION} du {VERSION_DATE}"]
+    """Une ligne par outil : utile pour voir d'un coup ce qui est à mettre à jour ou à retélécharger."""
+    abime = " — fichier abîmé ou modifié : à retélécharger"
+    lines = [f"{APP_NAME} {VERSION} du {VERSION_DATE}" + (abime if fichier_intact() is False else "")]
     for key, (name, _files) in SCRIPTS.items():
         path = script_path(key)
         if not path:
             continue
         ver, date = script_version(path)
-        lines.append(f"{name} {ver}" + (f" du {date}" if date else "") if ver
-                     else f"{name} : ancienne version, à mettre à jour")
+        line = (f"{name} {ver}" + (f" du {date}" if date else "") if ver
+                else f"{name} : ancienne version, à mettre à jour")
+        if ver and script_intact(path) is False:
+            line += abime
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -3743,7 +3795,9 @@ def verifier_pyside():
 
 def main():
     if "--version" in sys.argv[1:]:
-        print(f"{APP_NAME} {VERSION} du {VERSION_DATE}")
+        etat = {True: "fichier intact", False: "FICHIER MODIFIÉ OU ABÎMÉ : à retélécharger",
+                None: "fichier non vérifié"}[fichier_intact()]
+        print(f"{APP_NAME} {VERSION} du {VERSION_DATE} — {etat}")
         return 0
     verifier_pyside()
     global NATIVE
@@ -3780,6 +3834,7 @@ def main():
         app.styleHints().colorSchemeChanged.connect(on_scheme)
     except AttributeError:
         pass
+    QTimer.singleShot(500, avertir_si_abime)
     code = app.exec()
     lock.unlock()
     return code

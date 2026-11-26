@@ -29,7 +29,7 @@ import time
 import unicodedata
 
 APP_NAME = "Bloc-notes Pro"
-VERSION = "1.1"          # à augmenter à chaque modification
+VERSION = "1.2"          # à augmenter à chaque modification
 VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
 IS_MAC = sys.platform == "darwin"
@@ -48,6 +48,41 @@ def version_details():
     except ImportError:
         qt = "absent"
     return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
+
+
+EMPREINTE = "6f357fa6b10428c9"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
+
+
+def empreinte_fichier(path):
+    """Empreinte d'un script (fins de ligne normalisées, ligne EMPREINTE vidée) ; None si illisible."""
+    import hashlib
+    import re as _re
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    text = text.replace("\r\n", "\n")
+    text = _re.sub(r'^EMPREINTE = "[0-9a-f]*"', 'EMPREINTE = ""', text, count=1, flags=_re.M)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def fichier_intact():
+    """True : tel que livré ; False : modifié ou abîmé pendant la copie ; None : impossible à dire."""
+    if not EMPREINTE:
+        return None
+    got = empreinte_fichier(os.path.abspath(__file__))
+    return None if got is None else got == EMPREINTE
+
+
+def avertir_si_abime():
+    if fichier_intact() is False:
+        from PySide6.QtWidgets import QMessageBox
+        name = os.path.basename(os.path.abspath(__file__))
+        QMessageBox.warning(None, APP_NAME, f"Le fichier {name} n'est pas tel qu'il a été livré : il a été modifié "
+                                            "ou abîmé pendant sa copie (caractères disparus, fichier coupé…).\n\n"
+                                            "Certaines fonctions peuvent mal marcher. Récupère-le en téléchargeant "
+                                            "la pièce jointe telle quelle, sans copier-coller son contenu.")
 
 
 def explorer_script():
@@ -2609,7 +2644,7 @@ class Editor(QPlainTextEdit):
 
     # --- contenu ---
     def text(self):
-        return self.document().toRawText().replace(" ", "\n")
+        return self.document().toRawText().replace("\u2029", "\n")
 
     def load_text(self, text, default):
         """Remplace tout le contenu (fichier ouvert) en gardant chaque fin de ligne d'origine."""
@@ -3166,7 +3201,7 @@ class Editor(QPlainTextEdit):
         c = QTextCursor(self.document())
         c.setPosition(start)
         c.setPosition(min(end, self.document().characterCount() - 1), QTextCursor.MoveMode.KeepAnchor)
-        chunk = c.selection().toRawText().replace(" ", "\n")
+        chunk = c.selection().toRawText().replace("\u2029", "\n")
         pm = PosMap(chunk)
         color = Theme.ed("smart")
         out = []
@@ -3378,7 +3413,7 @@ class Editor(QPlainTextEdit):
         cur = QTextCursor(self.document())
         cur.setPosition(start)
         cur.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        lines = cur.selection().toRawText().split(" ")
+        lines = cur.selection().toRawText().split("\u2029")
         new = fn(lines)
         if new is None or new == lines:
             return False
@@ -3642,7 +3677,7 @@ class Editor(QPlainTextEdit):
         cur = QTextCursor(self.document())
         cur.setPosition(start)
         cur.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        lines = cur.selection().toRawText().split(" ")
+        lines = cur.selection().toRawText().split("\u2029")
         new = fn(lines)
         if new != lines:
             self.replace_range(start, end, "\n".join(new), select=rng is not None)
@@ -4168,7 +4203,7 @@ class FindDialog(QDialog):
     def open_tab(self, index, text=""):
         self.tabs.setCurrentIndex(index)
         self._tab_changed(index)
-        if text and "\n" not in text and " " not in text and len(text) < 300:
+        if text and "\n" not in text and "\u2029" not in text and len(text) < 300:
             self.find_edit.setCurrentText(text)
         self.show()
         self.raise_()
@@ -4657,7 +4692,7 @@ class HashDialog(QDialog):
         if ed is None:
             return
         if idx == 0:
-            data = ed.textCursor().selection().toRawText().replace(" ", "\n").encode("utf-8")
+            data = ed.textCursor().selection().toRawText().replace("\u2029", "\n").encode("utf-8")
         else:
             try:
                 data = encode_text(ed.content(), ed.encoding)
@@ -5261,7 +5296,7 @@ class RegexDialog(QDialog):
 
     # ------------------------------------------------------------------ texte à tester
     def test_text(self):
-        return self.test.document().toRawText().replace(" ", "\n").replace(" ", "\n")
+        return self.test.document().toRawText().replace("\u2029", "\n").replace("\u2028", "\n")
 
     def set_test(self, text):
         cur = self.test.textCursor()
@@ -5272,7 +5307,7 @@ class RegexDialog(QDialog):
         ed = self.win.current()
         if ed is None or not ed.textCursor().hasSelection():
             return ""
-        return ed.textCursor().selection().toRawText().replace(" ", "\n")
+        return ed.textCursor().selection().toRawText().replace("\u2029", "\n")
 
     def take_selection(self):
         sel = self._selection()
@@ -6720,7 +6755,7 @@ class MainWindow(QMainWindow):
         if ed.light:
             label += " (mode allégé)"
         self.s_lang.setText(label)
-        num = lambda n: f"{n:,}".replace(",", " ")  # noqa: E731
+        num = lambda n: f"{n:,}".replace(",", "\u202f")  # noqa: E731
         self.s_size.setText(f"longueur : {num(info['length'])}    lignes : {num(info['lines'])}")
         pos = f"Ln : {num(info['line'])}    Col : {info['col']}    Pos : {num(info['pos'])}"
         if info["sel_chars"] or info["sel_lines"] > 1:
@@ -6888,7 +6923,7 @@ class MainWindow(QMainWindow):
         if not cur.hasSelection():
             return
         start, end = cur.selectionStart(), cur.selectionEnd()
-        text = cur.selection().toRawText().replace(" ", "\n")
+        text = cur.selection().toRawText().replace("\u2029", "\n")
         ed.replace_range(start, end, fn(text))
 
     def duplicate(self, ed):
@@ -6896,7 +6931,7 @@ class MainWindow(QMainWindow):
             return
         cur = ed.textCursor()
         if cur.hasSelection():
-            text = cur.selection().toRawText().replace(" ", "\n")
+            text = cur.selection().toRawText().replace("\u2029", "\n")
             end = cur.selectionEnd()
             c = QTextCursor(ed.document())
             c.setPosition(end)
@@ -7040,7 +7075,7 @@ class MainWindow(QMainWindow):
         cur = ed.textCursor()
         if cur.hasSelection():
             return (cur.selectionStart(), cur.selectionEnd(),
-                    cur.selection().toRawText().replace(" ", "\n"), True)
+                    cur.selection().toRawText().replace("\u2029", "\n"), True)
         return 0, ed.document().characterCount() - 1, ed.text(), False
 
     def json_tool(self, ed, action):
@@ -7360,7 +7395,9 @@ def verifier_pyside():
 
 def main():
     if "--version" in sys.argv[1:]:
-        print(f"{APP_NAME} {VERSION} du {VERSION_DATE}")
+        etat = {True: "fichier intact", False: "FICHIER MODIFIÉ OU ABÎMÉ : à retélécharger",
+                None: "fichier non vérifié"}[fichier_intact()]
+        print(f"{APP_NAME} {VERSION} du {VERSION_DATE} — {etat}")
         return 0
     verifier_pyside()
     installer_verrou()
@@ -7395,6 +7432,7 @@ def main():
         app.styleHints().colorSchemeChanged.connect(lambda *_a: pref("theme") == "auto" and win.apply_theme())
     except AttributeError:
         pass
+    QTimer.singleShot(500, avertir_si_abime)
     code = app.exec()
     lock.unlock()
     return code

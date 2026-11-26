@@ -84,7 +84,25 @@ IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
 _P = os.path   # module de chemins (remplaçable dans les tests)
 APP_NAME = "Explorateur"
+VERSION = "1.0"          # à augmenter à chaque modification
+VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
+
+
+def version_details():
+    """Version du script, de Python et de PySide6 (pour comparer avec un collègue)."""
+    try:
+        import PySide6
+        qt = PySide6.__version__
+    except ImportError:
+        qt = "absent"
+    return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
+
+
+def chemin_court(path):
+    """Remplace le dossier personnel par « ~ » (pas de nom de compte dans les captures)."""
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
 
 
 def norm(path):
@@ -376,6 +394,12 @@ def annoter_script():
 def blocnotes_script():
     """Bloc-notes Pro (blocnotes.py), s'il est rangé à côté de ce programme."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocnotes.py")
+    return path if os.path.isfile(path) else ""
+
+
+def terminal_script():
+    """Terminal Pro (terminal.py), s'il est rangé à côté de ce programme."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "terminal.py")
     return path if os.path.isfile(path) else ""
 
 
@@ -1017,6 +1041,7 @@ QSplitter::handle:horizontal { width: 1px; }
 QStatusBar { background: @body; color: @text; }
 QStatusBar::item { border: none; }
 QStatusBar QToolButton { padding: 2px; }
+QStatusBar QLabel#version { color: @text2; padding: 0 8px; }
 QLabel#section { font-weight: 600; font-size: 15px; padding: 6px 0 4px 2px; }
 QMenu {
     background: @menu; border: 1px solid #D9D9D9; border-radius: 8px; padding: 4px;
@@ -3510,6 +3535,10 @@ class MainWindow(QMainWindow):
         self.btn_large.setToolTip("Afficher les éléments avec de grandes miniatures")
         self.btn_large.setCheckable(True)
         self.btn_large.clicked.connect(lambda: self.tab.set_view_mode("large"))
+        self.version_label = QLabel(f"v{VERSION}")
+        self.version_label.setObjectName("version")
+        self.version_label.setToolTip(version_details())
+        bar.addPermanentWidget(self.version_label)
         bar.addPermanentWidget(self.btn_details)
         bar.addPermanentWidget(self.btn_large)
 
@@ -3546,6 +3575,17 @@ class MainWindow(QMainWindow):
                     self.act_home_folder, None, self.act_address, self.act_search, None,
                     self.act_next_tab, self.act_prev_tab, None, self.act_terminal, self.act_reveal):
             m.addSeparator() if act is None else m.addAction(act)
+        m = bar.addMenu("Aide")
+        about = m.addAction(f"À propos de l'{APP_NAME}…", self.show_about)
+        about.setMenuRole(QAction.MenuRole.AboutRole)   # Mac : menu de l'application
+
+    def show_about(self):
+        import PySide6
+        QMessageBox.about(self, APP_NAME,
+                          f"<b>{APP_NAME}</b> — version {VERSION} du {VERSION_DATE}<br>"
+                          f"Explorateur de fichiers façon Windows 11.<br><br>"
+                          f"Python {sys.version.split()[0]} · PySide6 {PySide6.__version__}<br>"
+                          f"Script : {html.escape(chemin_court(os.path.abspath(__file__)))}")
 
     def _restore_geometry(self):
         s = settings()
@@ -3871,6 +3911,10 @@ class MainWindow(QMainWindow):
 
     def open_terminal(self, folder):
         if not folder:
+            return
+        script = terminal_script()
+        if script and not IS_WIN and os.path.isdir(folder):
+            detached(sys.executable, [script, folder])
             return
         if IS_MAC:
             detached("open", ["-a", "Terminal", folder])
@@ -4375,10 +4419,29 @@ class MainWindow(QMainWindow):
 
 # ======================================================================================
 
+def verifier_pyside():
+    """PySide6 6.12 plante avec Python 3.9 à 3.11 (« deallocating None ») : message clair au lieu d'un plantage."""
+    import PySide6
+    try:
+        ver = tuple(int(x) for x in PySide6.__version__.split(".")[:2])
+    except ValueError:
+        return
+    if sys.version_info < (3, 12) and ver >= (6, 12):
+        raise SystemExit(f"PySide6 {PySide6.__version__} plante avec Python {sys.version.split()[0]}.\n"
+                         "Corrige le venv avec :  pip install \"PySide6-Essentials<6.12\"\n"
+                         "(ou recrée-le avec Python 3.12 ou plus récent).")
+
+
+
 def main():
+    if "--version" in sys.argv[1:]:
+        print(f"{APP_NAME} {VERSION} du {VERSION_DATE}")
+        return 0
+    verifier_pyside()
     args = [a for a in sys.argv[1:] if not a.startswith("-psn")]
     app = QApplication([sys.argv[0]])
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(VERSION)
     app.setOrganizationName(ORG_NAME)
     apply_theme(app)
     app.setWindowIcon(Icons.big("folder"))

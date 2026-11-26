@@ -35,9 +35,20 @@ from functools import lru_cache
 
 APP_NAME = "Terminal Pro"
 ORG_NAME = "explorateur-maison"
-VERSION = "1.0"
+VERSION = "1.1"          # à augmenter à chaque modification
+VERSION_DATE = "26/11/2026"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def version_details():
+    """Version du script, de Python et de PySide6 (pour comparer avec un collègue)."""
+    try:
+        import PySide6
+        qt = PySide6.__version__
+    except ImportError:
+        qt = "absent"
+    return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
 
 
 def explorer_script():
@@ -231,14 +242,28 @@ DEFAULT_DB = {
     "psmpUsernameTemplate": "${node}", "defaultSshPort": 22, "defaultUsername": "", "defaultPsmpReason": "",
     "favoriteCategoryName": "★ Elasticsearch",
 }
+# Raisons prédéfinies de la passerelle (texte exact, à envoyer sans la moindre variation)
+PSM_REASONS = [
+    ("Morning checks", "To be used only for morning check access. The access should be performed in the "
+                       "morning (before 11 AM)."),
+    ("Audit & configuration checks", "To be used in case of audit access or configuration check out of the "
+                                     "morning checks."),
+    ("Suspected incident", "To be used in case of accessing infrastructure is needed for a suspected incident "
+                           "before raising it."),
+    ("New server implementation", "In the case of a accessing a new server for ongoing migration."),
+    ("Security patch", "To use for Security patch update on PRE-PRODUCTION and BACKUP environments."),
+]
+DEFAULT_PSM_REASON = "Audit & configuration checks"
 REASON_PATTERN = r"(?i)(reason|raison|motif|justification)[^:\r\n]*:\s*$"
 CODE_PATTERN = r"(?i)(passcode|pin|password|mot de passe|code)[^:\r\n]*:\s*$"
 DEFAULT_SETTINGS = {
     "fontFamily": "", "fontSize": 13 if IS_MAC else 11, "colorScheme": "Campbell", "cursorShape": "bar",
     "cursorBlink": True, "scrollback": 10000, "defaultProfile": "", "closeOnExit": "graceful",
     "copyOnSelect": False, "confirmClose": True, "sidebarVisible": False, "sidebarWidth": 330,
-    "psmpUserLogin": "", "askReason": True, "defaultReason": "", "reasonPattern": REASON_PATTERN,
+    "psmpUserLogin": "", "askReason": True, "defaultReason": DEFAULT_PSM_REASON, "reasonPattern": REASON_PATTERN,
+    "reasonChoices": [list(r) for r in PSM_REASONS],
     "codePattern": CODE_PATTERN, "autoWindow": 180, "optionAsMeta": False, "geometry": "", "warnPaste": True,
+    "reasonAscii": False, "reasonMaxLen": 0,
 }
 
 
@@ -541,6 +566,60 @@ def build_plan(conn, variables, psmp_default_login="", ssh=None):
         argv += ["-p", str(port)]
     argv.append(dest)
     return SshPlan(argv, shlex.join(["ssh"] + argv[1:]), "", host, False)
+
+
+_ASCII_FIX = {"œ": "oe", "Œ": "OE", "æ": "ae", "Æ": "AE", "ß": "ss", "’": "'", "‘": "'", "«": '"', "»": '"',
+              "“": '"', "”": '"', "–": "-", "—": "-", "…": "...", "€": "EUR"}
+
+
+def clean_reason(text, ascii_only=False, max_len=0):
+    """Raison PSM prête à envoyer -> (texte, problème). Problème non vide = on n'envoie rien.
+
+    Une seule ligne, sans caractère de contrôle ni espace en trop, accents sous leur forme normale,
+    jamais vide, jamais de ${VARIABLE} non remplacée."""
+    t = unicodedata.normalize("NFC", text or "")
+    t = re.sub(r"\s+", " ", t)                                     # retours à la ligne, tabulations, espaces insécables
+    t = "".join(ch for ch in t if not unicodedata.category(ch).startswith("C"))
+    t = re.sub(r" {2,}", " ", t).strip()
+    if ascii_only:
+        t = re.sub(r"«\s*", '"', re.sub(r"\s*»", '"', t))
+        t = "".join(_ASCII_FIX.get(ch, ch) for ch in t)
+        t = "".join(ch for ch in unicodedata.normalize("NFKD", t) if not unicodedata.combining(ch))
+        t = unicodedata.normalize("NFC", t)
+        bad = sorted({ch for ch in t if not ch.isascii()})
+        if bad:
+            return t, "caractère impossible à écrire sans accent : " + " ".join(bad)
+    if not t:
+        return "", "la raison est vide"
+    if re.search(r"\$\{[^}]*\}", t):
+        return t, "une variable n'a pas été remplacée : " + re.search(r"\$\{[^}]*\}", t).group(0)
+    if max_len and len(t) > int(max_len):
+        return t, f"trop longue ({len(t)} caractères, {int(max_len)} au maximum) : elle serait coupée"
+    return t, ""
+
+
+def reason_choices(settings):
+    """Raisons prédéfinies (nom exact, description)."""
+    out = []
+    for item in (settings or {}).get("reasonChoices") or []:
+        if isinstance(item, (list, tuple)) and item and isinstance(item[0], str) and item[0].strip():
+            out.append((item[0].strip(), str(item[1]) if len(item) > 1 else ""))
+    return out or list(PSM_REASONS)
+
+
+def canon_reason(text, choices=PSM_REASONS):
+    """Si le texte correspond à une raison prédéfinie (casse ou espaces près), renvoie son orthographe exacte."""
+    key = re.sub(r"\s+", " ", unicodedata.normalize("NFC", text or "")).strip().casefold()
+    for name, _desc in choices:
+        if key and key == re.sub(r"\s+", " ", name).strip().casefold():
+            return name
+    return clean_reason(text)[0]
+
+
+def pick_reason(raw, settings):
+    """Raison à envoyer -> (texte, problème) : prédéfinie à l'identique, sinon texte nettoyé et contrôlé."""
+    exact = canon_reason(raw, reason_choices(settings))
+    return clean_reason(exact, settings.get("reasonAscii", False), settings.get("reasonMaxLen", 0))
 
 
 @dataclass
@@ -1334,6 +1413,23 @@ class Screen:
             return self.lines[r]
         return None
 
+    def text_from(self, abs_row, col):
+        """Texte affiché entre une position (ligne absolue, colonne) et le curseur."""
+        end_abs = self.history_total + self.cy
+        end_col = self.cols if self.wrap_pending else self.cx
+        out = []
+        for r in range(abs_row, end_abs + 1):
+            line = self.line_at(r)
+            if line is None:
+                continue
+            a = col if r == abs_row else 0
+            b = end_col if r == end_abs else self.cols
+            part = "".join(line.chars[a:b])
+            if r < end_abs and not line.wrapped:
+                part = part.rstrip() + "\n"
+            out.append(part)
+        return "".join(out)
+
     def prompt_text(self):
         """Ce qui est écrit sur la ligne du curseur, avant lui (pour les réponses automatiques)."""
         line = self.lines[self.cy]
@@ -1900,10 +1996,10 @@ from PySide6.QtCore import (QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSi
 from PySide6.QtGui import (QAction, QColor, QFont, QFontDatabase, QFontMetricsF,  # noqa: E402
                            QGuiApplication, QIcon, QKeySequence, QPainter, QPainterPath, QPalette, QPen,
                            QPixmap, QPolygonF)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,  # noqa: E402
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,  # noqa: E402
                                QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
                                QRadioButton, QScrollArea, QScrollBar, QSpinBox, QSplitter,
                                QStackedWidget, QTabBar, QTabWidget, QToolButton, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -2154,6 +2250,11 @@ class Session(QObject):
         self._reap = QTimer(self)
         self._reap.setInterval(40)
         self._reap.timeout.connect(self._check_exit)
+        self._reason = None                  # envoi de la raison en cours (vérifié lettre par lettre)
+        self._last_output = 0.0
+        self._reason_timer = QTimer(self)
+        self._reason_timer.setInterval(50)
+        self._reason_timer.timeout.connect(self._reason_tick)
         if spec.banner:
             self.screen.feed(spec.banner)
 
@@ -2221,6 +2322,7 @@ class Session(QObject):
             if text:
                 self.screen.feed(text)
                 changed = True
+                self._last_output = time.monotonic()
         if changed:
             self._check_rules()
             self.output.emit()
@@ -2293,13 +2395,76 @@ class Session(QObject):
                         self.notify.emit("code", "Tape ton PIN + code RSA")
                 break
             rule.fired = True
+            if rule.label == "raison PSM":
+                self._start_reason(rule)
+                break
             resp = rule.response
             QTimer.singleShot(150, lambda r=resp: self.write(r + "\r"))
-            if rule.label == "raison PSM":
-                self.notify.emit("reason", f"Raison PSM envoyée : « {resp} »")
-            else:
-                self.notify.emit("info", f"Réponse automatique envoyée ({rule.label})")
+            self.notify.emit("info", f"Réponse automatique envoyée ({rule.label})")
             break
+
+    # ---- raison PSM : envoi vérifié
+    def _start_reason(self, rule):
+        """1) attendre que le serveur ait fini d'écrire ; 2) taper la raison SANS valider ;
+        3) relire ce que le serveur affiche ; 4) Entrée seulement si c'est exactement la raison."""
+        text, problem = clean_reason(rule.response, self.settings.get("reasonAscii", False),
+                                     self.settings.get("reasonMaxLen", 0))
+        if problem:
+            self.notify.emit("error", f"Raison non envoyée ({problem}) : tape-la toi-même.")
+            return
+        self._reason = {"rule": rule, "text": text, "stage": "quiet", "deadline": time.monotonic() + 6.0}
+        self._reason_timer.start()
+
+    def _end_reason(self, kind=None, message=""):
+        self._reason = None
+        self._reason_timer.stop()
+        if kind:
+            self.notify.emit(kind, message)
+
+    def user_typed(self):
+        """Tu as tapé quelque chose : l'envoi automatique s'arrête net (rien n'est validé à ta place)."""
+        if self._reason is not None:
+            sent = self._reason["stage"] == "echo"
+            self._end_reason("warn", "Envoi automatique de la raison interrompu : tu as la main."
+                             + (" Vérifie la ligne avant d'appuyer sur Entrée." if sent else ""))
+
+    def _reason_tick(self):
+        job = self._reason
+        if job is None or not self.running:
+            self._end_reason()
+            return
+        now = time.monotonic()
+        s = self.screen
+        target = job["text"]
+        if job["stage"] == "quiet":
+            if now - self._last_output < 0.3:
+                if now > job["deadline"]:
+                    job["rule"].fired = False
+                    self._end_reason("error", "Le serveur écrit sans arrêt : raison non envoyée, tape-la toi-même.")
+                return
+            if not job["rule"].regex.search(s.prompt_text()):
+                job["rule"].fired = False                 # la question a disparu : rien n'a été tapé
+                self._end_reason()
+                return
+            job["start"] = (s.history_total + s.cy, s.cols if s.wrap_pending else s.cx)
+            job["stage"] = "echo"
+            job["deadline"] = now + 4.0
+            self.write(target)                        # sans Entrée
+            return
+        shown = s.text_from(*job["start"])
+        if shown == target:
+            self.write("\r")
+            self._end_reason("reason", f"Raison PSM envoyée et vérifiée : « {target} »")
+        elif len(shown) > len(target) or (shown and not target.startswith(shown)):
+            self._end_reason("error", f"Le serveur affiche « {shown[:70]} » au lieu de la raison : rien n'a été "
+                                      "validé. Corrige la ligne puis appuie sur Entrée.")
+        elif now > job["deadline"]:
+            if not shown:
+                self._end_reason("warn", "Raison tapée, mais le serveur ne l'affiche pas : impossible de la "
+                                         "vérifier. Appuie sur Entrée si tu es sûr, sinon efface-la.")
+            else:
+                self._end_reason("error", f"Raison incomplète à l'écran (« {shown} ») : rien n'a été validé. "
+                                          "Corrige la ligne puis appuie sur Entrée.")
 
     def _on_title(self, t):
         self.title = t or self.spec.name
@@ -2739,11 +2904,12 @@ class TerminalView(QWidget):
         data = encode_key(ev, s.screen, self.app.config.settings.get("optionAsMeta", False))
         if data:
             self.clear_selection()
+            if self.toast.isVisible() and self.toast.property("kind") in ("code", "focus", "error", "warn"):
+                self.toast.hide()
+            s.user_typed()
             s.write(data)
             self.scroll_to_bottom()
             self._blink_on = True
-            if self.toast.isVisible() and self.toast.property("kind") in ("code", "focus"):
-                self.toast.hide()
         else:
             super().keyPressEvent(ev)
 
@@ -2751,6 +2917,7 @@ class TerminalView(QWidget):
         txt = ev.commitString()
         if txt and self.session.running:
             self.clear_selection()
+            self.session.user_typed()
             self.session.write(txt)
             self.scroll_to_bottom()
         ev.accept()
@@ -2971,6 +3138,7 @@ class TerminalView(QWidget):
                            f"Tu vas coller {n} lignes : chacune sera exécutée comme une commande.\n\n"
                            + txt[:400] + ("…" if len(txt) > 400 else ""), ok="Coller"):
                 return
+        self.session.user_typed()
         self.session.paste(txt)
         self.scroll_to_bottom()
 
@@ -3014,18 +3182,19 @@ class TerminalView(QWidget):
 
     # ---- notifications dans le volet
     def show_notice(self, kind, message):
-        self.toast.setText(("🔑  " if kind == "code" else "✓  " if kind == "reason" else "")
-                           + message)
+        self.toast.setText({"code": "🔑  ", "reason": "✓  ", "error": "⚠  ", "warn": "⚠  "}.get(kind, "") + message)
         self.toast.setProperty("kind", kind)
+        self.toast.setStyleSheet({"error": "QLabel#toast { border-color: #E74856; }",
+                                  "warn": "QLabel#toast { border-color: #FCE100; }"}.get(kind, ""))
         self.toast.adjustSize()
         self._place_toast()
         self.toast.show()
         self.toast.raise_()
-        if kind == "code":
+        if kind in ("code", "error", "warn"):
             self._toast_timer.stop()          # reste affiché jusqu'à ce que tu tapes
             win = self.window()
             if not win.isActiveWindow():
-                QApplication.alert(win, 0)
+                QApplication.alert(win, 0)    # le Dock rebondit
             if self.isVisible():
                 self.setFocus()
         else:
@@ -3177,34 +3346,156 @@ class KeyValueEditor(QWidget):
 # Dialogues
 # ======================================================================================
 
-class ReasonDialog(QDialog):
-    """Raison PSM demandée au moment de se connecter (pré-remplie avec la dernière)."""
+class ReasonCombo(QComboBox):
+    """Champ « raison » : choisir dans la liste évite toute faute de frappe ; texte libre possible."""
+    textChanged = Signal(str)
 
-    def __init__(self, parent, target, history, default=""):
+    def __init__(self, value, choices, placeholder=""):
+        super().__init__()
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.addItems([n for n, _d in choices])
+        self.setCurrentText(value or "")
+        self.lineEdit().setPlaceholderText(placeholder)
+        self.editTextChanged.connect(self.textChanged)
+
+    def text(self):
+        return self.currentText()
+
+    def setText(self, value):
+        self.setCurrentText(value)
+
+
+class ReasonDialog(QDialog):
+    """Raison PSM, comme sur le portail : une raison prédéfinie (sans faute possible) ou une autre."""
+
+    def __init__(self, parent, target, history, default="", ascii_only=False, max_len=0, choices=None, now=None):
         super().__init__(parent)
+        self.ascii_only, self.max_len = ascii_only, max_len
+        self.choices = list(choices or PSM_REASONS)
+        self.now = now or datetime.datetime.now()
         self.setWindowTitle("Raison de la connexion")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(620)
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(f"Connexion PSMP vers <b>{target}</b>"))
-        lay.addWidget(hint("Elle sera tapée automatiquement quand le serveur la demandera, après ton PIN + code RSA."))
-        self.combo = QComboBox()
-        self.combo.setEditable(True)
-        self.combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        items = [default] if default else []
-        items += [h for h in history if h and h != default]
-        self.combo.addItems(items)
-        self.combo.setCurrentText(items[0] if items else "")
-        self.combo.lineEdit().selectAll()
-        lay.addWidget(self.combo)
+        lay.addWidget(hint("Tapée quand la passerelle la demande (après ton PIN + code RSA), puis relue à l'écran : "
+                           "Entrée n'est envoyée que si le texte affiché est exactement celui-ci."))
+        lay.addWidget(QLabel("<b>Choisis une raison</b>"))
+        box = QFrame()
+        box.setObjectName("card")
+        bl = QVBoxLayout(box)
+        bl.setSpacing(2)
+        self.group = QButtonGroup(self)
+        self.radios = {}
+        for name, desc in self.choices:
+            rb = QRadioButton(name.replace("&", "&&"))
+            f = rb.font()
+            f.setBold(True)
+            rb.setFont(f)
+            self.group.addButton(rb)
+            self.radios[name] = rb
+            bl.addWidget(rb)
+            if desc:
+                d = hint(desc)
+                d.setContentsMargins(24, 0, 0, 6)
+                bl.addWidget(d)
+            rb.toggled.connect(lambda on, n=name: on and self._radio_chosen())
+        lay.addWidget(box)
+        lay.addWidget(QLabel("<b>Ou saisis une autre raison</b>"))
+        self.free = QComboBox()
+        self.free.setEditable(True)
+        self.free.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        names = {n.casefold() for n, _d in self.choices}
+        custom = []
+        for h in history:
+            clean, problem = clean_reason(h, ascii_only, max_len)
+            if clean and not problem and clean.casefold() not in names and clean not in custom:
+                custom.append(clean)
+        self.free.addItems(custom)
+        self.free.setCurrentText("")
+        self.free.lineEdit().setPlaceholderText("Ta raison")
+        self.free.editTextChanged.connect(self._free_typed)
+        lay.addWidget(self.free)
+        self.preview = QLabel("")
+        self.preview.setWordWrap(True)
+        self.preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self.preview)
+        self.warning = QLabel("")
+        self.warning.setWordWrap(True)
+        lay.addWidget(self.warning)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Se connecter")
+        self.ok = bb.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok.setText("Se connecter")
         bb.button(QDialogButtonBox.StandardButton.Cancel).setText("Annuler")
-        bb.accepted.connect(self.accept)
+        bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+        exact = canon_reason(default, self.choices) if default else ""
+        if exact in self.radios:
+            self.radios[exact].setChecked(True)
+        elif default and default.strip():
+            self.free.setCurrentText(default)
+        else:
+            rb = self.radios.get(DEFAULT_PSM_REASON) or next(iter(self.radios.values()), None)
+            if rb is not None:
+                rb.setChecked(True)
+        self._check()
+
+    def _uncheck_all(self):
+        self.group.setExclusive(False)
+        for rb in self.radios.values():
+            rb.setChecked(False)
+        self.group.setExclusive(True)
+
+    def _radio_chosen(self):
+        self.free.blockSignals(True)
+        self.free.setCurrentText("")
+        self.free.blockSignals(False)
+        self._check()
+
+    def _free_typed(self, text):
+        if text.strip():
+            self._uncheck_all()
+        self._check()
+
+    def selected(self):
+        return next((n for n, rb in self.radios.items() if rb.isChecked()), "")
+
+    def _value(self):
+        name = self.selected()
+        if name:
+            return clean_reason(name, self.ascii_only, self.max_len)
+        return clean_reason(canon_reason(self.free.currentText(), self.choices), self.ascii_only, self.max_len)
+
+    def _check(self, *_a):
+        clean, problem = self._value()
+        if not self.selected() and not self.free.currentText().strip():
+            problem = "choisis une raison ou saisis-en une"
+        self.ok.setEnabled(not problem)
+        if problem:
+            self.preview.setText(f"<span style='color:#FF99A4'>⚠ {problem[:1].upper() + problem[1:]}</span>")
+        else:
+            esc = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            self.preview.setText(f"Sera envoyé ({len(clean)} caractères) : « <b>{esc}</b> »")
+        notes = []
+        raw = self.free.currentText()
+        if not problem and not self.selected() and clean in self.radios:
+            notes.append("reconnue comme raison prédéfinie : orthographe exacte utilisée")
+        elif not problem and not self.selected() and clean != raw.strip():
+            notes.append("espaces en trop, retours à la ligne ou caractères invisibles retirés")
+        if not problem and not clean.isascii():
+            notes.append("contient des accents : vérifie à la 1re connexion qu'ils sont bien enregistrés côté "
+                         "CyberArk (sinon coche « Raison sans accents » dans Paramètres › PSMP)")
+        if clean == "Morning checks" and self.now.hour >= 11:
+            notes.append(f"« Morning checks » est prévue pour le matin, avant 11 h (il est {self.now:%H:%M})")
+        self.warning.setText("<span style='color:#FCE100'>" + "<br>".join(notes) + "</span>" if notes else "")
+
+    def _accept(self):
+        if self.ok.isEnabled():
+            self.accept()
 
     def reason(self):
-        return self.combo.currentText().strip()
+        return self._value()[0]
 
 
 class CategoryDialog(QDialog):
@@ -3360,8 +3651,13 @@ class ConnectionDialog(QDialog):
         entry(fs, "psmpUserLogin", "Login personnel",
               tip=f"Vide = celui des paramètres ({app.config.settings.get('psmpUserLogin') or 'non défini'})")
         entry(fs, "psmpTechnicalAccount", "Compte technique")
-        entry(fs, "psmpReason", "Raison PSM", tip="Tapée automatiquement quand le serveur la demande "
-                                                  "(après ton PIN + code RSA).")
+        choices = reason_choices(app.config.settings)
+        self.e["psmpReason"] = rc = ReasonCombo(node.get("psmpReason", ""), choices, "vide = raison par défaut")
+        rc.textChanged.connect(self.update_preview)
+        fs.addRow("Raison PSM", rc)
+        fs.addRow("", hint("Choisis-la dans la liste pour éviter toute faute. Tapée automatiquement quand la "
+                           "passerelle la demande (après ton PIN + code RSA)."))
+        self._choices = choices
         for page in (pa, pk, pp, ps):
             self.auth_pages.addWidget(page)
         tabs.addTab(a, "Authentification")
@@ -3435,6 +3731,8 @@ class ConnectionDialog(QDialog):
             d[k] = _int(d.get(k))
         d.update({"authType": self.auth_type(), "type": "connection", "variables": self.vars.get(),
                   "autoResponses": self.rules.get()})
+        if d.get("psmpReason") and "${" not in d["psmpReason"]:
+            d["psmpReason"] = canon_reason(d["psmpReason"], self._choices)
         return d
 
     def update_preview(self, *_a):
@@ -3531,7 +3829,9 @@ class EsDatabaseDialog(QDialog):
         entry(fp, "psmpGatewayPort", "Port passerelle")
         entry(fp, "psmpUsernameTemplate", "Compte technique", "Modèle : ${node}, ${node.lower}, ${node.upper} "
                                                               "(si le nœud n'est pas dans la table des nœuds)")
-        entry(fp, "defaultPsmpReason", "Raison PSM par défaut")
+        self.e["defaultPsmpReason"] = ReasonCombo(db.get("defaultPsmpReason", ""),
+                                                  reason_choices(app.config.settings), "vide = raison par défaut")
+        fp.addRow("Raison PSM par défaut", self.e["defaultPsmpReason"])
         entry(fp, "defaultSshPort", "Port ssh cible")
         entry(fp, "defaultUsername", "Utilisateur (sans PSMP)")
         entry(fp, "favoriteCategoryName", "Catégorie des favoris")
@@ -3595,6 +3895,8 @@ class EsDatabaseDialog(QDialog):
         d = dict(self.db)
         for k, w in self.e.items():
             d[k] = w.text().strip()
+        if d.get("defaultPsmpReason"):
+            d["defaultPsmpReason"] = canon_reason(d["defaultPsmpReason"], reason_choices(self.app.config.settings))
         d["authType"] = next((k for k, b in self.auth_btns.items() if b.isChecked()), "none")
         d["basicAuthUsername"] = self.user.text().strip()
         fm = dict(d["fieldMapping"])
@@ -3820,8 +4122,13 @@ class SettingsDialog(QDialog):
         self.ask = QCheckBox("Demander la raison à chaque connexion PSMP (pré-remplie avec la dernière)")
         self.ask.setChecked(s.get("askReason", True))
         fp.addRow("", self.ask)
-        self.reason = QLineEdit(s.get("defaultReason", ""))
+        self.reason = ReasonCombo(s.get("defaultReason") or DEFAULT_PSM_REASON, reason_choices(s))
         fp.addRow("Raison par défaut", self.reason)
+        self.choices_edit = QPlainTextEdit("\n".join(f"{n} | {d}" for n, d in reason_choices(s)))
+        self.choices_edit.setFixedHeight(110)
+        self.choices_edit.setFont(mono_font("", 11))
+        fp.addRow("Raisons prédéfinies", self.choices_edit)
+        fp.addRow("", hint("Une par ligne : « Nom exact | description ». Le nom est envoyé tel quel."))
         self.rpat = QLineEdit(s.get("reasonPattern", REASON_PATTERN))
         self.cpat = QLineEdit(s.get("codePattern", CODE_PATTERN))
         for w in (self.rpat, self.cpat):
@@ -3830,6 +4137,15 @@ class SettingsDialog(QDialog):
         fp.addRow("Invite « PIN + code »", self.cpat)
         fp.addRow("", hint("Expressions régulières testées sur la ligne où attend le curseur. "
                            "La raison est tapée pour toi ; pour le PIN + code, le terminal te prévient seulement."))
+        self.ascii = QCheckBox("Raison sans accents (é → e, œ → oe…) si la passerelle les enregistre mal")
+        self.ascii.setChecked(s.get("reasonAscii", False))
+        fp.addRow("", self.ascii)
+        self.maxlen = QSpinBox()
+        self.maxlen.setRange(0, 2000)
+        self.maxlen.setSpecialValueText("pas de limite")
+        self.maxlen.setSuffix(" caractères")
+        self.maxlen.setValue(int(s.get("reasonMaxLen", 0) or 0))
+        fp.addRow("Longueur max. de la raison", self.maxlen)
         self.window_s = QSpinBox()
         self.window_s.setRange(20, 3600)
         self.window_s.setSuffix(" s")
@@ -3868,7 +4184,19 @@ class SettingsDialog(QDialog):
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
+    def parsed_choices(self):
+        out = []
+        for line in self.choices_edit.toPlainText().splitlines():
+            name, _sep, desc = line.partition("|")
+            name = clean_reason(name)[0]
+            if name and name.casefold() not in {n.casefold() for n, _d in out}:
+                out.append([name, desc.strip()])
+        return out
+
     def _ok(self):
+        if not self.parsed_choices():
+            QMessageBox.warning(self, "Raisons", "Il faut au moins une raison prédéfinie.")
+            return
         for w, label in ((self.rpat, "raison"), (self.cpat, "PIN + code")):
             try:
                 re.compile(w.text())
@@ -3915,8 +4243,10 @@ class SettingsDialog(QDialog):
                 "copyOnSelect": self.cos.isChecked(), "warnPaste": self.wp.isChecked(),
                 "confirmClose": self.cc.isChecked(), "optionAsMeta": self.oam.isChecked(),
                 "psmpUserLogin": self.login.text().strip(), "askReason": self.ask.isChecked(),
-                "defaultReason": self.reason.text().strip(), "reasonPattern": self.rpat.text(),
-                "codePattern": self.cpat.text(), "autoWindow": self.window_s.value()}
+                "defaultReason": canon_reason(self.reason.text(), [tuple(c) for c in self.parsed_choices()]),
+                "reasonChoices": self.parsed_choices(), "reasonPattern": self.rpat.text(),
+                "codePattern": self.cpat.text(), "autoWindow": self.window_s.value(),
+                "reasonAscii": self.ascii.isChecked(), "reasonMaxLen": self.maxlen.value()}
 
 
 # ======================================================================================
@@ -4422,6 +4752,22 @@ class SearchPanel(QWidget):
         self.status.setText(f"« {node['name']} » ajouté aux favoris.")
 
 
+class VersionLabel(QLabel):
+    """Numéro de version en bas du panneau ; un clic ouvre « À propos »."""
+
+    def __init__(self, app):
+        super().__init__(f"{APP_NAME} {VERSION}")
+        self.app = app
+        self.setObjectName("hint")
+        self.setContentsMargins(10, 2, 10, 4)
+        self.setToolTip(version_details() + " — cliquer pour « À propos »")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.app.show_about()
+
+
 class Sidebar(QWidget):
     def __init__(self, app):
         super().__init__()
@@ -4441,6 +4787,8 @@ class Sidebar(QWidget):
         self.stack.addWidget(self.conn)
         self.stack.addWidget(self.es)
         lay.addWidget(self.stack, 1)
+        self.version = VersionLabel(app)
+        lay.addWidget(self.version)
 
     def show_page(self, i):
         self.bar.setCurrentIndex(i)
@@ -5086,19 +5434,23 @@ class MainWindow(QMainWindow):
             return
         reason = ""
         if plan.psmp:
-            reason = resolve(node.get("psmpReason"), variables) or st.get("defaultReason", "")
-            if st.get("askReason", True):
-                dlg = ReasonDialog(self, plan.target, self.config.data.get("reasons", []), reason)
+            raw = resolve(node.get("psmpReason"), variables).strip() or st.get("defaultReason") or DEFAULT_PSM_REASON
+            reason, problem = pick_reason(raw, st)
+            if st.get("askReason", True) or problem:          # jamais de raison vide ou douteuse
+                dlg = ReasonDialog(self, plan.target, self.config.data.get("reasons", []),
+                                   reason if not problem else raw, st.get("reasonAscii", False),
+                                   st.get("reasonMaxLen", 0), reason_choices(st))
                 if not dlg.exec():
                     return
                 reason = dlg.reason()
+            if not reason:
+                return
             self.config.add_reason(reason)
             self.save()
         lines = [f"→ {plan.display}"]
         if plan.psmp:
             lines.append("→ PIN + code RSA : à toi de les taper quand ils sont demandés")
-            lines.append(f"→ raison PSM tapée automatiquement : « {reason} »" if reason else
-                         "→ raison PSM : aucune enregistrée, tu la taperas")
+            lines.append(f"→ raison PSM tapée puis vérifiée à l'écran avant Entrée : « {reason} »")
         banner = "\x1b[90m" + "\r\n".join(lines) + "\x1b[0m\r\n"
         settings = st
         spec = LaunchSpec(node.get("name") or plan.target, plan.argv, "ssh", os.path.expanduser("~"), "ssh",
@@ -5141,7 +5493,7 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(glyph_icon("settings", UI["text"]), "Paramètres", self.open_settings)
         m.addAction("Raccourcis clavier", self.show_shortcuts)
-        m.addAction(f"À propos de {APP_NAME}", self.show_about)
+        m.addAction(f"À propos de {APP_NAME} ({VERSION})", self.show_about)
         m.exec(self.menu_btn.mapToGlobal(QPoint(0, self.menu_btn.height())))
 
     def _tab_menu(self, pos):
@@ -5243,7 +5595,10 @@ class MainWindow(QMainWindow):
     def show_about(self):
         problems = controle_reseau()
         state = "actif ✓" if _VERROU["actif"] and not problems else ("actif" if _VERROU["actif"] else "inactif")
-        QMessageBox.about(self, APP_NAME, f"<b>{APP_NAME} {VERSION}</b><br>Terminal à onglets façon Windows Terminal."
+        import PySide6
+        QMessageBox.about(self, APP_NAME, f"<b>{APP_NAME}</b> — version {VERSION} du {VERSION_DATE}<br>"
+                                          f"Terminal à onglets façon Windows Terminal.<br>"
+                                          f"Python {sys.version.split()[0]} · PySide6 {PySide6.__version__}"
                                           f"<br><br>Verrou anti-exfiltration : {state}<br>"
                                           f"Programmes autorisés : "
                                           f"{', '.join(sorted(os.path.basename(p) for p in _EXEC_AUTORISES))}<br>"
@@ -5272,7 +5627,25 @@ class MainWindow(QMainWindow):
         ev.accept()
 
 
+def verifier_pyside():
+    """PySide6 6.12 plante avec Python 3.9 à 3.11 (« deallocating None ») : message clair au lieu d'un plantage."""
+    import PySide6
+    try:
+        ver = tuple(int(x) for x in PySide6.__version__.split(".")[:2])
+    except ValueError:
+        return
+    if sys.version_info < (3, 12) and ver >= (6, 12):
+        raise SystemExit(f"PySide6 {PySide6.__version__} plante avec Python {sys.version.split()[0]}.\n"
+                         "Corrige le venv avec :  pip install \"PySide6-Essentials<6.12\"\n"
+                         "(ou recrée-le avec Python 3.12 ou plus récent).")
+
+
+
 def main():
+    if "--version" in sys.argv[1:]:
+        print(f"{APP_NAME} {VERSION} du {VERSION_DATE}")
+        return 0
+    verifier_pyside()
     if not (sys.platform == "darwin" or sys.platform.startswith("linux")):
         raise SystemExit(f"{APP_NAME} fonctionne sur Mac (et Linux).")
     os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
@@ -5288,6 +5661,7 @@ def main():
     if tr.load("qtbase_fr", QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)):
         app.installTranslator(tr)               # boutons standard en français (Annuler, Enregistrer…)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(VERSION)
     app.setOrganizationName(ORG_NAME)
     app.setStyle("Fusion")
     pal = QPalette()

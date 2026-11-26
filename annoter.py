@@ -52,7 +52,19 @@ except ImportError:
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "Annoteur"
+VERSION = "1.0"          # à augmenter à chaque modification
+VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
+
+
+def version_details():
+    """Version du script, de Python et de PySide6 (pour comparer avec un collègue)."""
+    try:
+        import PySide6
+        qt = PySide6.__version__
+    except ImportError:
+        qt = "absent"
+    return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
 
 C = {
     "chrome": "#F7F9FC", "body": "#FFFFFF", "border": "#E3E3E3", "line": "#EBEBEB",
@@ -1438,6 +1450,9 @@ class MainWindow(QMainWindow):
         sb.setSizeGripEnabled(False)
         self.hint_label = QLabel()
         sb.addWidget(self.hint_label, 1)
+        self.version_label = QLabel(f"v{VERSION}")
+        self.version_label.setToolTip(version_details())
+        sb.addPermanentWidget(self.version_label)
         self.size_label = QLabel()
         sb.addPermanentWidget(self.size_label)
         sb.addPermanentWidget(self._btn("minus", tip="Zoom arrière", slot=lambda: self.canvas.zoom_by(1 / 1.25)))
@@ -1738,10 +1753,29 @@ class MainWindow(QMainWindow):
         self.update_zoom()
 
 
+def verifier_pyside():
+    """PySide6 6.12 plante avec Python 3.9 à 3.11 (« deallocating None ») : message clair au lieu d'un plantage."""
+    import PySide6
+    try:
+        ver = tuple(int(x) for x in PySide6.__version__.split(".")[:2])
+    except ValueError:
+        return
+    if sys.version_info < (3, 12) and ver >= (6, 12):
+        raise SystemExit(f"PySide6 {PySide6.__version__} plante avec Python {sys.version.split()[0]}.\n"
+                         "Corrige le venv avec :  pip install \"PySide6-Essentials<6.12\"\n"
+                         "(ou recrée-le avec Python 3.12 ou plus récent).")
+
+
+
 def main():
+    if "--version" in sys.argv[1:]:
+        print(f"{APP_NAME} {VERSION} du {VERSION_DATE}")
+        return 0
+    verifier_pyside()
     args = [a for a in sys.argv[1:] if not a.startswith("-psn")]
     app = QApplication([sys.argv[0]])
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(VERSION)
     app.setOrganizationName(ORG_NAME)
     apply_theme(app)
     app.setWindowIcon(Icons.get("app", 64))

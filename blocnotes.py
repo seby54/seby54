@@ -29,6 +29,8 @@ import time
 import unicodedata
 
 APP_NAME = "Bloc-notes Pro"
+VERSION = "1.0"          # à augmenter à chaque modification
+VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
@@ -36,6 +38,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BIG_FILE = 16 * 1024 * 1024        # au-delà : mode allégé (sans coloration ni repli)
 HUGE_FILE = 200 * 1024 * 1024      # au-delà : on n'ouvre pas
 sys.setrecursionlimit(max(sys.getrecursionlimit(), 6000))
+
+
+def version_details():
+    """Version du script, de Python et de PySide6 (pour comparer avec un collègue)."""
+    try:
+        import PySide6
+        qt = PySide6.__version__
+    except ImportError:
+        qt = "absent"
+    return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
 
 
 def explorer_script():
@@ -51,10 +63,13 @@ def explorer_script():
 # ======================================================================================
 
 _NET_MODULES = frozenset({
-    "socket", "_socket", "ssl", "_ssl", "http", "urllib", "urllib3", "ftplib", "smtplib",
+    "socket", "_socket", "ssl", "_ssl", "http", "urllib3", "ftplib", "smtplib",
     "imaplib", "poplib", "nntplib", "telnetlib", "xmlrpc", "socketserver", "asyncio",
     "webbrowser", "requests", "httpx", "aiohttp", "paramiko", "multiprocessing", "mailbox",
 })
+# urllib : seule la partie qui télécharge est interdite. urllib.parse ne fait que découper du texte
+# (Python 3.9 et 3.10 le chargent d'office avec PySide6).
+_NET_SUBMODULES = frozenset({"urllib.request", "urllib.robotparser", "urllib.response"})
 _QT_NET = frozenset({
     "QtNetwork", "QtNetworkAuth", "QtWebEngineCore", "QtWebEngineWidgets", "QtWebEngineQuick",
     "QtWebSockets", "QtWebChannel", "QtWebView", "QtHttpServer", "QtRemoteObjects",
@@ -76,7 +91,7 @@ def module_reseau(name):
     if not isinstance(name, str):
         return False
     parts = name.split(".")
-    if parts[0] in _NET_MODULES:
+    if parts[0] in _NET_MODULES or ".".join(parts[:2]) in _NET_SUBMODULES:
         return True
     return parts[0] == "PySide6" and len(parts) > 1 and parts[1] in _QT_NET
 
@@ -5986,6 +6001,10 @@ class MainWindow(QMainWindow):
         sb.addWidget(self.s_lang, 1)
         for seg in (self.s_size, self.s_pos, self.s_eol, self.s_enc, self.s_mode):
             sb.addPermanentWidget(seg)
+        self.s_version = StatusSeg(version_details() + " — cliquer pour « À propos »")
+        self.s_version.setText(f"v{VERSION}")
+        sb.addPermanentWidget(self.s_version)
+        self.s_version.clicked.connect(self.about)
         self.s_lang.clicked.connect(lambda: self.lang_menu.exec(QCursor_pos()))
         self.s_eol.clicked.connect(lambda: self.eol_menu.exec(QCursor_pos()))
         self.s_enc.clicked.connect(lambda: self.encoding_menu.exec(QCursor_pos()))
@@ -7040,9 +7059,15 @@ class MainWindow(QMainWindow):
         problems = controle_reseau()
         state = "actif ✓ — aucun module réseau chargé" if not problems and _VERROU["actif"] else \
             ("actif" if _VERROU["actif"] else "inactif (mode test)")
-        QMessageBox.about(self, APP_NAME, f"<b>{APP_NAME}</b><br>Éditeur de texte façon Notepad++.<br><br>"
+        import PySide6
+        home = os.path.expanduser("~")
+        prive = data_dir()
+        prive = "~" + prive[len(home):] if prive.startswith(home + os.sep) else prive
+        QMessageBox.about(self, APP_NAME, f"<b>{APP_NAME}</b> — version {VERSION} du {VERSION_DATE}<br>"
+                                          f"Éditeur de texte façon Notepad++.<br><br>"
+                                          f"Python {sys.version.split()[0]} · PySide6 {PySide6.__version__}<br>"
                                           f"Verrou anti-réseau : {state}<br>"
-                                          f"Dossier privé : {data_dir()}")
+                                          f"Dossier privé : {prive.replace('&', '&amp;').replace('<', '&lt;')}")
 
     # ------------------------------------------------------------------ session
     def save_session(self):
@@ -7209,10 +7234,29 @@ def send_request(paths):
     os.replace(tmp, os.path.join(folder, name))
 
 
+def verifier_pyside():
+    """PySide6 6.12 plante avec Python 3.9 à 3.11 (« deallocating None ») : message clair au lieu d'un plantage."""
+    import PySide6
+    try:
+        ver = tuple(int(x) for x in PySide6.__version__.split(".")[:2])
+    except ValueError:
+        return
+    if sys.version_info < (3, 12) and ver >= (6, 12):
+        raise SystemExit(f"PySide6 {PySide6.__version__} plante avec Python {sys.version.split()[0]}.\n"
+                         "Corrige le venv avec :  pip install \"PySide6-Essentials<6.12\"\n"
+                         "(ou recrée-le avec Python 3.12 ou plus récent).")
+
+
+
 def main():
+    if "--version" in sys.argv[1:]:
+        print(f"{APP_NAME} {VERSION} du {VERSION_DATE}")
+        return 0
+    verifier_pyside()
     installer_verrou()
     QApplication.setOrganizationName(ORG_NAME)
     QApplication.setApplicationName(APP_NAME)
+    QApplication.setApplicationVersion(VERSION)
     app = QApplication(sys.argv[:1])
     app.setWindowIcon(glyph_icon("app"))
     paths = [os.path.abspath(a) for a in sys.argv[1:] if not a.startswith("-psn")]

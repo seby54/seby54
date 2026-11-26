@@ -29,10 +29,22 @@ import time
 import unicodedata
 
 APP_NAME = "Barre des tâches"
+VERSION = "1.0"          # à augmenter à chaque modification
+VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
+
+
+def version_details():
+    """Version du script, de Python et de PySide6 (pour comparer avec un collègue)."""
+    try:
+        import PySide6
+        qt = PySide6.__version__
+    except ImportError:
+        qt = "absent"
+    return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
 
 # Toujours le chemin complet : un programme du même nom posé ailleurs ne peut pas
 # être lancé à la place du vrai.
@@ -50,6 +62,7 @@ SCRIPTS = {
     "script:explorateur": ("Explorateur de fichiers", ("explor.py", "explorateur.py")),
     "script:annoteur": ("Annoteur", ("annoter.py",)),
     "script:blocnotes": ("Bloc-notes Pro", ("blocnotes.py",)),
+    "script:terminal": ("Terminal Pro", ("terminal.py",)),
 }
 
 FINDER = "/System/Library/CoreServices/Finder.app"
@@ -72,15 +85,46 @@ def script_path(key):
     return ""
 
 
+_VERSION_RE = re.compile(r'^VERSION\s*=\s*"([^"\n]{1,20})"', re.M)
+_DATE_RE = re.compile(r'^VERSION_DATE\s*=\s*"([^"\n]{1,20})"', re.M)
+
+
+def script_version(path):
+    """(version, date) lues dans l'en-tête du script ; ("", "") pour une version sans numéro."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = f.read(20000)
+    except OSError:
+        return "", ""
+    v, d = _VERSION_RE.search(head), _DATE_RE.search(head)
+    return (v.group(1) if v else ""), (d.group(1) if d else "")
+
+
+def versions_text():
+    """Une ligne par outil : utile pour voir d'un coup ce qui est à mettre à jour."""
+    lines = [f"{APP_NAME} {VERSION} du {VERSION_DATE}"]
+    for key, (name, _files) in SCRIPTS.items():
+        path = script_path(key)
+        if not path:
+            continue
+        ver, date = script_version(path)
+        lines.append(f"{name} {ver}" + (f" du {date}" if date else "") if ver
+                     else f"{name} : ancienne version, à mettre à jour")
+    return "\n".join(lines)
+
+
 # ======================================================================================
 # Verrou anti-exfiltration
 # ======================================================================================
 
 _NET_MODULES = frozenset({
-    "socket", "_socket", "ssl", "_ssl", "http", "urllib", "urllib3", "ftplib", "smtplib",
+    "socket", "_socket", "ssl", "_ssl", "http", "urllib3", "ftplib", "smtplib",
     "imaplib", "poplib", "nntplib", "telnetlib", "xmlrpc", "socketserver", "asyncio",
     "webbrowser", "requests", "httpx", "aiohttp", "paramiko", "multiprocessing", "mailbox",
 })
+# urllib : seule la partie qui télécharge est interdite. urllib.parse ne fait que découper du texte
+# (Python 3.9 et 3.10 le chargent d'office avec PySide6).
+_NET_SUBMODULES = frozenset({"urllib.request", "urllib.robotparser", "urllib.response"})
 _QT_NET = frozenset({
     "QtNetwork", "QtNetworkAuth", "QtWebEngineCore", "QtWebEngineWidgets", "QtWebEngineQuick",
     "QtWebSockets", "QtWebChannel", "QtWebView", "QtHttpServer", "QtRemoteObjects",
@@ -113,7 +157,7 @@ def module_reseau(name):
     if not isinstance(name, str):
         return False
     parts = name.split(".")
-    if parts[0] in _NET_MODULES:
+    if parts[0] in _NET_MODULES or ".".join(parts[:2]) in _NET_SUBMODULES:
         return True
     return parts[0] == "PySide6" and len(parts) > 1 and parts[1] in _QT_NET
 
@@ -1107,6 +1151,23 @@ def _(p, c):
     p.drawLine(QPointF(15.0, 7.0), QPointF(10.2, 13.4))
 
 
+@_glyph("terminalpro")
+def _(p, c):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#1B1D21"))
+    p.drawRoundedRect(QRectF(1.0, 2.0, 14.0, 12.0), 2.2, 2.2)
+    p.setBrush(QColor("#3A3F47"))
+    p.drawRoundedRect(QRectF(1.0, 2.0, 14.0, 2.6), 2.2, 2.2)
+    p.drawRect(QRectF(1.0, 3.6, 14.0, 1.0))
+    _pen(p, "#4CC2FF", 1.5)
+    p.drawPolyline(QPolygonF([QPointF(3.6, 6.8), QPointF(6.2, 9.0), QPointF(3.6, 11.2)]))
+    _pen(p, "#FFFFFF", 1.4)
+    p.drawLine(QPointF(7.6, 11.4), QPointF(10.4, 11.4))
+    _pen(p, "#FCE100", 1.1)
+    p.drawEllipse(QPointF(12.4, 7.4), 1.2, 1.2)
+    p.drawLine(QPointF(12.4, 8.6), QPointF(12.4, 12.4))
+
+
 @_glyph("appwin")
 def _(p, c):
     p.setPen(Qt.PenStyle.NoPen)
@@ -1217,6 +1278,8 @@ def icon_for(key, path=""):
             icon = glyph_icon("annoteur")
         elif key == "script:blocnotes":
             icon = glyph_icon("blocnotes")
+        elif key == "script:terminal":
+            icon = glyph_icon("terminalpro")
         elif path and os.path.exists(path):
             icon = icon_provider().icon(QFileInfo(path))
         else:
@@ -2517,11 +2580,16 @@ class TaskbarSettings(QWidget):
         v.addWidget(note)
         v.addStretch(1)
         row = QHBoxLayout()
+        self.versions = QLabel()
+        self.versions.setObjectName("dim")
+        self.versions.setToolTip(version_details())
+        self.versions.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(self.versions, 0, Qt.AlignmentFlag.AlignBottom)
         row.addStretch(1)
         quit_btn = QPushButton("Quitter la barre des tâches")
         quit_btn.setObjectName("pill")
         quit_btn.clicked.connect(quit_all)
-        row.addWidget(quit_btn)
+        row.addWidget(quit_btn, 0, Qt.AlignmentFlag.AlignBottom)
         v.addLayout(row)
 
     def _set(self, name, value):
@@ -2530,6 +2598,7 @@ class TaskbarSettings(QWidget):
 
     def sync(self):
         """Remet chaque contrôle sur la valeur enregistrée (la fenêtre est réutilisée)."""
+        self.versions.setText(versions_text())
         values = ((self.search_combo, {"hidden": 0, "icon": 1, "box": 2}.get(opt("search"), 2)),
                   (self.align_combo, 0 if opt("align") == "center" else 1))
         for combo, index in values:
@@ -3494,6 +3563,8 @@ class Bar(QWidget):
         add_action(menu, "Paramètres de la barre des tâches", self.open_settings, "gear")
         menu.addSeparator()
         add_action(menu, "Quitter la barre des tâches", self.quit_bar)
+        menu.addSeparator()
+        add_action(menu, f"{APP_NAME} {VERSION}", lambda: None, enabled=False)
         size = menu.sizeHint()
         menu.exec(QPoint(global_pos.x(), self.geometry().y() - size.height() - 8))
         menu.deleteLater()
@@ -3656,7 +3727,25 @@ def make_backend():
     return Backend()
 
 
+def verifier_pyside():
+    """PySide6 6.12 plante avec Python 3.9 à 3.11 (« deallocating None ») : message clair au lieu d'un plantage."""
+    import PySide6
+    try:
+        ver = tuple(int(x) for x in PySide6.__version__.split(".")[:2])
+    except ValueError:
+        return
+    if sys.version_info < (3, 12) and ver >= (6, 12):
+        raise SystemExit(f"PySide6 {PySide6.__version__} plante avec Python {sys.version.split()[0]}.\n"
+                         "Corrige le venv avec :  pip install \"PySide6-Essentials<6.12\"\n"
+                         "(ou recrée-le avec Python 3.12 ou plus récent).")
+
+
+
 def main():
+    if "--version" in sys.argv[1:]:
+        print(f"{APP_NAME} {VERSION} du {VERSION_DATE}")
+        return 0
+    verifier_pyside()
     global NATIVE
     installer_verrou()
     if IS_MAC:
@@ -3665,6 +3754,7 @@ def main():
     app = QApplication([sys.argv[0]])
     os.environ.pop("QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM", None)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(VERSION)
     app.setOrganizationName(ORG_NAME)
     app.setQuitOnLastWindowClosed(False)
     lock = QLockFile(os.path.join(QDir.tempPath(), "barre-des-taches.lock"))

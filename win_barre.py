@@ -29,7 +29,7 @@ import time
 import unicodedata
 
 APP_NAME = "Barre des tâches"
-VERSION = "1.2"          # à augmenter à chaque modification
+VERSION = "1.3"          # à augmenter à chaque modification
 VERSION_DATE = "26/11/2026"
 ORG_NAME = "explorateur-maison"
 IS_MAC = sys.platform == "darwin"
@@ -47,8 +47,8 @@ def version_details():
     return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
 
 
-EMPREINTE = "bc73c4aa04c4b567"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
-REPERES = "3888:7c2ba68a,814da036,b6a3a771,6dfc2cc4,00524c0d,7bd588e9,60cac986,a1db85eb,63f6f98a,d2a185a5,976600d6,9e21a13b,263c8941,eb81ebbf,8c8a077e,89a7503c"            # remplis à la livraison : nombre de lignes et empreinte de chaque tranche de 250 lignes
+EMPREINTE = "932d744885416495"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
+REPERES = "3896:de136a9f,814da036,b6a3a771,6dfc2cc4,00524c0d,7bd588e9,60cac986,a1db85eb,63f6f98a,d2a185a5,976600d6,9e21a13b,263c8941,02437163,412631fa,366d073b"            # remplis à la livraison : nombre de lignes et empreinte de chaque tranche de 250 lignes
 
 
 def _texte_compare(path):
@@ -3277,7 +3277,7 @@ class Bar(QWidget):
             self.refresh(force=True)
         pos = QCursor.pos()
         geo = self.geometry()
-        near = geo.adjusted(0, -160, 0, 0).contains(pos)
+        near = self._on_bar(pos, geo, above=160)
         if self.options.get("autohide"):
             self.autohide_tick(pos, time.monotonic())
         elif self._autohidden:
@@ -3313,11 +3313,19 @@ class Bar(QWidget):
         return ((fly is not None and fly.isVisible()) or self.pressed is not None or bool(self._drag)
                 or QApplication.activePopupWidget() is not None)
 
+    @staticmethod
+    def _on_bar(pos, geo, above=0):
+        """Souris sur la barre (ou `above` px au-dessus). Le bas de l'écran compte : sur Mac, souris
+        collée tout en bas, sa position est annoncée une ligne SOUS le dernier pixel (bas de la barre + 1)."""
+        return geo.left() <= pos.x() <= geo.right() and geo.top() - above <= pos.y() <= geo.bottom() + 2
+
     def autohide_tick(self, pos, now):
-        """Appelé ~25 fois par seconde : sort la barre au bord, la range quand on s'en va."""
+        """Appelé ~25 fois par seconde : sort la barre au bord, la range quand on s'en va.
+        Sortir et rester utilisent la même zone, bord de l'écran compris : sinon, souris tout en bas,
+        la barre sortait puis se rangeait 0,6 s plus tard, et ainsi de suite."""
         geo = self.geometry()
         if self._autohidden:
-            at_edge = geo.left() <= pos.x() <= geo.right() and geo.bottom() - 1 <= pos.y() <= geo.bottom() + 1
+            at_edge = self._on_bar(pos, geo) and pos.y() >= geo.bottom() - 1
             if not at_edge:
                 self._edge_since = None
             elif self._edge_since is None:
@@ -3325,7 +3333,7 @@ class Bar(QWidget):
             elif now - self._edge_since >= 0.06:
                 self.reveal()
             return
-        if geo.adjusted(0, -6, 0, 0).contains(pos) or self._keep_visible():
+        if self._on_bar(pos, geo, above=6) or self._keep_visible():
             self._leave_at = None
         elif self._leave_at is None:
             self._leave_at = now

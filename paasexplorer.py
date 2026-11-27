@@ -5,8 +5,8 @@ PaaS Explorer — explorateur des clusters IBM Cloud Kubernetes Service et Red H
 façon Explorateur de fichiers Windows 11, pour le Mac du travail.
 
 * Même environnement que les autres outils : PySide6-Essentials + bibliothèque standard.
-* Reprend les fonctions du PaaSExplorer d'origine (comptes, clusters, namespaces, pods, logs, YAML,
-  charts Helm, topologie, vue d'ensemble, terminal dans les pods, mode démo).
+* Reprend les fonctions de consultation du PaaSExplorer d'origine (comptes, clusters, namespaces, pods, logs,
+  YAML, charts Helm, topologie, vue d'ensemble, mode démo), avec favoris et recherche de namespaces.
 * Verrou anti-exfiltration (« audit hook » Python, impossible à retirer une fois posé) :
   - le programme ne lance aucun autre programme ;
   - il ne se connecte qu'aux adresses d'IBM Cloud (*.cloud.ibm.com), aux points d'accès que tu
@@ -15,8 +15,9 @@ façon Explorateur de fichiers Windows 11, pour le Mac du travail.
   - codes à usage unique, jetons et clés restent en mémoire : rien n'est jamais enregistré.
 * Connexion comme « oc login -u passcode » : adresse du serveur + namespace(s) + code à usage unique pris sur
   https://iam.cloud.ibm.com/identity/passcode (pas besoin de clé API, ni du droit de lister les clusters).
-* Lecture seule au démarrage : supprimer, mettre à l'échelle et redémarrer demandent d'abord
-  d'autoriser les modifications (menu Cluster).
+* Lecture seule, toujours : rien ne se modifie depuis l'outil (il n'envoie que des requêtes GET au cluster).
+  Pour modifier (mettre à l'échelle, redémarrer, supprimer, éditer, terminal dans un pod), le bouton
+  « Console » ouvre la bonne page de la console web OpenShift, ou du portail IBM Cloud.
 
 Lancement :  ~/mac/explorer/venv/bin/python ~/mac/explorer/paasexplorer.py
 """
@@ -33,23 +34,20 @@ import os
 import queue
 import random
 import re
-import shlex
 import shutil
 import socket
 import ssl
-import struct
 import sys
 import threading
 import time
 import unicodedata
 import zipfile
 from collections import deque
-from functools import lru_cache
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 APP_NAME = "PaaS Explorer"
 ORG_NAME = "explorateur-maison"
-VERSION = "2.1"          # à augmenter à chaque modification (1.0.0 = version d'origine en Tkinter)
+VERSION = "2.2"          # à augmenter à chaque modification (1.0.0 = version d'origine en Tkinter)
 VERSION_DATE = "27/11/2026"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,8 +63,8 @@ def version_details():
     return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
 
 
-EMPREINTE = "2f62225d53c6d425"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
-REPERES = "8527:84cb5125,fffd0a45,dbeb1104,3b1cae54,c1fb0c4c,174ecde3,ce70526c,1cb94afe,9f84ad4f,59f50945,c55c368a,c3cbf834,66a80d58,7217cf54,110512b9,27ce01ac,e4afb254,02b1fe7b,0278fdce,913dbc1b,a3bf1305,488d3ee7,308c02ae,a89167b0,a864dba6,a91ed473,fb00de09,4ea1924c,763b4323,4ef1d1be,b21b48a3,6a2d115e,49fb6ff7,7e172fe6,a2695784"            # remplis à la livraison : nombre de lignes et empreinte de chaque tranche de 250 lignes
+EMPREINTE = "8287b425d4c64a19"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
+REPERES = "6591:79074cc7,fcf2d424,e3b11202,8a4b6ac7,74c78319,201c05c9,c8a64e1a,3366eabd,a203750f,7e293d51,68470a7b,f44b2244,7454bf52,1b58719a,2d3d0c6f,a745e6e9,92838458,5fb38e6a,064d6bd5,4f9a2d2d,1e7d3ef1,360c00cd,eb102ef8,eb31b83a,52ffbdb9,2d03deae,795d1aa2"            # remplis à la livraison : nombre de lignes et empreinte de chaque tranche de 250 lignes
 
 
 def _texte_compare(path):
@@ -283,7 +281,6 @@ DEFAULT_DOMAINS = ("cloud.ibm.com",)
 DEFAULT_SETTINGS = {
     "showSystemNamespaces": False, "detailsPane": True, "logTail": 500, "navWidth": 290,
     "windowGeometry": "", "useMacCerts": True, "caFile": "", "proxy": "auto", "extraDomains": [],
-    "colorScheme": "Campbell", "fontFamily": "", "fontSize": 13, "optionAsMeta": False, "warnPaste": True,
 }
 
 
@@ -291,7 +288,8 @@ class Config:
     def __init__(self, folder=None):
         self.dir = folder or data_dir()
         self.path = os.path.join(self.dir, "config.json")
-        self.data = {"version": 1, "settings": dict(DEFAULT_SETTINGS), "accounts": [], "clusterPrefs": {}}
+        self.data = {"version": 1, "settings": dict(DEFAULT_SETTINGS), "accounts": [], "clusterPrefs": {},
+                     "favorites": [], "nsCache": {}}
         self.imported = False
         if os.path.isfile(self.path):
             self.load()
@@ -378,8 +376,12 @@ def clean_account(a):
         if isinstance(nss, str):
             nss = re.split(r"[\s,;]+", nss)
         nss = [n.strip().lower() for n in nss if n and NS_RE.match(n.strip().lower())]
-        return {"name": name, "kind": "cluster", "server": str(a.get("server", "")).strip().rstrip("/"),
-                "namespaces": list(dict.fromkeys(nss)), "iamUrl": iam}
+        console = str(a.get("console") or "").strip().rstrip("/")
+        out = {"name": name, "kind": "cluster", "server": str(a.get("server", "")).strip().rstrip("/"),
+               "namespaces": list(dict.fromkeys(nss)), "iamUrl": iam}
+        if console.startswith("https://"):
+            out["console"] = console
+        return out
     return {"name": name, "kind": "ibm", "iamUrl": iam,
             "csUrl": str(a.get("csUrl") or CS_DEFAULT).strip().rstrip("/")}
 
@@ -966,6 +968,49 @@ class DirectAccount:
         return kube
 
 
+PORTAL = "https://cloud.ibm.com"
+# Ressources que la console OpenShift connaît sous leur nom court dans ses adresses
+CONSOLE_PLURALS = {"pods", "services", "configmaps", "secrets", "persistentvolumeclaims", "serviceaccounts",
+                   "events", "deployments", "statefulsets", "daemonsets", "replicasets", "jobs", "cronjobs",
+                   "routes", "deploymentconfigs", "buildconfigs", "builds", "imagestreams", "ingresses",
+                   "horizontalpodautoscalers", "networkpolicies", "roles", "rolebindings", "nodes",
+                   "persistentvolumes", "storageclasses", "namespaces", "projects"}
+
+
+def console_ref(res):
+    """Nom de la ressource dans les adresses de la console : « deployments » ou « groupe~version~Kind »."""
+    if res.get("name") in CONSOLE_PLURALS:
+        return res["name"]
+    return f"{res.get('group') or 'core'}~{res.get('version', 'v1')}~{res.get('kind', '')}"
+
+
+def console_link(base, view="cluster", ns=None, res=None, name=None, page=""):
+    """Adresse d'une page de la console web OpenShift (là où se font les modifications)."""
+    base = (base or "").rstrip("/")
+    if not base:
+        return ""
+    if view == "topology" and ns:
+        return f"{base}/topology/ns/{ns}"
+    if view == "helm" and ns:
+        return f"{base}/helm-releases/ns/{ns}" + (f"/release/{name}" if name else "")
+    if res is not None:
+        ref = console_ref(res)
+        url = f"{base}/k8s/ns/{ns}/{ref}" if ns and res.get("namespaced", True) else f"{base}/k8s/cluster/{ref}"
+        return url + (f"/{name}" if name else "") + (f"/{page}" if name and page else "")
+    if ns:
+        return f"{base}/k8s/cluster/projects/{ns}"
+    return base
+
+
+def portal_link(cluster=None):
+    """Page du cluster dans le portail IBM Cloud (ou la liste des clusters si on ne connaît pas son identifiant)."""
+    cid = (cluster or {}).get("id")
+    kind = "openshift" if (cluster or {}).get("type", "openshift") == "openshift" else "kubernetes"
+    if cid and cid != "cluster" and re.match(r"^[A-Za-z0-9-]+$", cid):
+        return f"{PORTAL}/kubernetes/clusters/{cid}/overview?platformType={kind}"
+    return f"{PORTAL}/kubernetes/clusters?platformType={kind}"
+
+
 def _ca_from_kubeconfig(text):
     m = re.search(r'certificate-authority-data:\s*"?([A-Za-z0-9+/=]+)', text)
     if m:
@@ -977,168 +1022,8 @@ def _ca_from_kubeconfig(text):
 
 
 # ======================================================================================
-# WebSocket (terminal dans les pods)
-# ======================================================================================
-
-class WSError(Exception):
-    pass
-
-
-class WSClient:
-    OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
-
-    def __init__(self, url, headers=None, subprotocols=(), ssl_ctx=None, timeout=20):
-        self.url = url
-        self.headers = headers or {}
-        self.subprotocols = list(subprotocols)
-        self.ssl_ctx = ssl_ctx
-        self.timeout = timeout
-        self.sock = None
-        self.protocol = None
-        self._send_lock = threading.Lock()
-        self._buf = b""
-        self.closed = False
-
-    def connect(self):
-        u = urlsplit(self.url)
-        if u.scheme != "wss" or not u.hostname:
-            raise WSError("connexion chiffrée (wss) obligatoire")
-        host, port = u.hostname, u.port or 443
-        path = (u.path or "/") + ("?" + u.query if u.query else "")
-        try:
-            sock = NET.tls(host, port, self.ssl_ctx, self.timeout)
-        except NetError as exc:
-            raise WSError(str(exc)) from None
-        key = base64.b64encode(os.urandom(16)).decode()
-        lines = [f"GET {path} HTTP/1.1", f"Host: {host}:{port}", "Upgrade: websocket", "Connection: Upgrade",
-                 f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13"]
-        if self.subprotocols:
-            lines.append("Sec-WebSocket-Protocol: " + ", ".join(self.subprotocols))
-        for k, v in self.headers.items():
-            lines.append(f"{k}: {v}")
-        try:
-            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
-            resp = self._read_headers(sock)
-        except OSError as exc:
-            sock.close()
-            raise WSError(f"négociation interrompue : {exc}") from None
-        status_line = resp.split(b"\r\n", 1)[0].decode(errors="replace")
-        if " 101" not in status_line:
-            body = self._buf.decode(errors="replace")[:400]
-            sock.close()
-            raise WSError(f"{status_line} {body}".strip())
-        expect = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
-        for line in resp.decode(errors="replace").split("\r\n")[1:]:
-            low = line.lower()
-            if low.startswith("sec-websocket-protocol:"):
-                self.protocol = line.split(":", 1)[1].strip()
-            elif low.startswith("sec-websocket-accept:") and line.split(":", 1)[1].strip().encode() != expect:
-                sock.close()
-                raise WSError("réponse WebSocket invalide")
-        sock.settimeout(None)
-        self.sock = sock
-        return self
-
-    def _read_headers(self, sock):
-        data = self._buf
-        while b"\r\n\r\n" not in data:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise WSError("connexion fermée pendant la négociation")
-            data += chunk
-            if len(data) > 65536:
-                raise WSError("en-têtes trop longs")
-        head, _, rest = data.partition(b"\r\n\r\n")
-        self._buf = rest
-        return head
-
-    def send(self, payload, opcode=OP_BIN):
-        if self.closed:
-            return
-        n = len(payload)
-        header = bytes([0x80 | opcode])
-        if n < 126:
-            header += bytes([0x80 | n])
-        elif n < 65536:
-            header += bytes([0x80 | 126]) + struct.pack("!H", n)
-        else:
-            header += bytes([0x80 | 127]) + struct.pack("!Q", n)
-        mask = os.urandom(4)
-        masked = (int.from_bytes(payload, "big") ^ int.from_bytes((mask * (n // 4 + 1))[:n], "big")).to_bytes(n, "big") \
-            if n else b""
-        with self._send_lock:
-            try:
-                self.sock.sendall(header + mask + masked)
-            except OSError:
-                self.closed = True
-
-    def _recv_exact(self, n):
-        while len(self._buf) < n:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise WSError("connexion fermée")
-            self._buf += chunk
-        out, self._buf = self._buf[:n], self._buf[n:]
-        return out
-
-    def recv(self):
-        """(opcode, données) d'un message complet ; (OP_CLOSE, b'') à la fermeture."""
-        frags, first_op = [], None
-        while True:
-            try:
-                b1, b2 = self._recv_exact(2)
-                fin, op = b1 & 0x80, b1 & 0x0F
-                n = b2 & 0x7F
-                if n == 126:
-                    n = struct.unpack("!H", self._recv_exact(2))[0]
-                elif n == 127:
-                    n = struct.unpack("!Q", self._recv_exact(8))[0]
-                mask = self._recv_exact(4) if b2 & 0x80 else None
-                data = self._recv_exact(n) if n else b""
-            except (WSError, OSError, ssl.SSLError):
-                self.closed = True
-                return self.OP_CLOSE, b""
-            if mask:
-                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-            if op == self.OP_PING:
-                self.send(data, self.OP_PONG)
-                continue
-            if op == self.OP_PONG:
-                continue
-            if op == self.OP_CLOSE:
-                self.closed = True
-                return self.OP_CLOSE, data
-            if op != self.OP_CONT:
-                first_op = op
-            frags.append(data)
-            if fin:
-                return first_op, b"".join(frags)
-
-    def close(self):
-        if not self.closed:
-            try:
-                self.send(struct.pack("!H", 1000), self.OP_CLOSE)
-            except Exception:  # noqa: BLE001
-                pass
-        self.closed = True
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.sock.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-# ======================================================================================
 # Client Kubernetes
 # ======================================================================================
-
-EXEC_COMMAND = ["/bin/sh", "-c",
-                "TERM=xterm-256color; export TERM; "
-                "if command -v bash >/dev/null 2>&1; then exec bash -il; else exec sh -il; fi"]
-
 
 class KubeClient:
     demo = False
@@ -1149,6 +1034,7 @@ class KubeClient:
         self.ca_pem = ca_pem
         self.flavor = flavor
         self.user = ""
+        self.console = ""                 # adresse de la console web (trouvée à la connexion)
         self._discovery = None
         self._lock = threading.Lock()
 
@@ -1205,7 +1091,9 @@ class KubeClient:
         return h
 
     def _raw(self, method, path, params=None, body=None, ctype="application/json", timeout=30):
-        data = json.dumps(body).encode() if body is not None and not isinstance(body, bytes) else body
+        if method != "GET" or body is not None:          # outil en lecture seule : aucune requête qui modifie
+            raise KubeError("Lecture seule : les modifications se font dans la console OpenShift.", 405)
+        data = None
         url = self._url(path, params)
         for force in (False, True):
             try:
@@ -1288,21 +1176,6 @@ class KubeClient:
     def get(self, res, ns, name):
         return self.request("GET", self.path(res, ns, name))
 
-    def delete(self, res, ns, name):
-        return self.request("DELETE", self.path(res, ns, name), body={"propagationPolicy": "Background"})
-
-    def patch(self, res, ns, name, body, merge=True):
-        return self.request("PATCH", self.path(res, ns, name), body=body,
-                            ctype="application/merge-patch+json" if merge else "application/strategic-merge-patch+json")
-
-    def scale(self, res, ns, name, replicas):
-        return self.patch(res, ns, name, {"spec": {"replicas": int(replicas)}})
-
-    def restart(self, res, ns, name):
-        now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return self.patch(res, ns, name, {"spec": {"template": {"metadata": {"annotations": {
-            "kubectl.kubernetes.io/restartedAt": now}}}}})
-
     # ---- logs
     def logs(self, ns, pod, container=None, tail=500, timestamps=False, previous=False):
         return self.text(f"/api/v1/namespaces/{ns}/pods/{pod}/log",
@@ -1340,28 +1213,6 @@ class KubeClient:
         finally:
             conn.close()
 
-    # ---- terminal
-    def exec_ws(self, ns, pod, container, command):
-        params = [("stdin", "true"), ("stdout", "true"), ("stderr", "true"), ("tty", "true")]
-        if container:
-            params.append(("container", container))
-        params += [("command", c) for c in command]
-        url = self.server.replace("https://", "wss://") + f"/api/v1/namespaces/{ns}/pods/{pod}/exec?" + urlencode(params)
-        last = None
-        for force in (False, True):
-            ws = WSClient(url, {"Authorization": "Bearer " + self._token(force)},
-                          ["v4.channel.k8s.io", "channel.k8s.io"], self.ctx)
-            try:
-                return ws.connect()
-            except WSError as exc:
-                last = exc
-                if " 401" not in str(exc):
-                    break
-        raise KubeError(f"Ouverture du terminal impossible : {last}")
-
-    def exec_backend(self, ns, pod, container):
-        return WsExecBackend(self, ns, pod, container)
-
     # ---- métriques
     def pod_metrics(self, ns):
         try:
@@ -1383,66 +1234,18 @@ class KubeClient:
         except KubeError:
             return ""
 
-
-class WsExecBackend:
-    """Terminal réel : WebSocket « exec » de l'API Kubernetes (canaux v4.channel.k8s.io)."""
-
-    def __init__(self, kube, ns, pod, container):
-        self.kube, self.ns, self.pod, self.container = kube, ns, pod, container
-        self.title = pod + (f" [{container}]" if container else "")
-        self.ws = None
-        self.put = None
-
-    def start(self, cols, rows, put):
-        self.put = put
-        put(f"\x1b[90mConnexion au pod {self.ns}/{self.pod}"
-            f"{' (' + self.container + ')' if self.container else ''}…\x1b[0m\r\n".encode())
-        threading.Thread(target=self._run, args=(cols, rows), daemon=True).start()
-
-    def _run(self, cols, rows):
+    def find_console(self, fallback=""):
+        """Adresse de la console web OpenShift, comme « oc whoami --show-console » (ConfigMap console-public,
+        lisible par tout utilisateur connecté). À défaut : <serveur>/console, qui redirige vers la console."""
         try:
-            self.ws = self.kube.exec_ws(self.ns, self.pod, self.container, EXEC_COMMAND)
-        except Exception as exc:  # noqa: BLE001
-            self.put(("exit", -1, str(exc)))
-            return
-        self.resize(cols, rows)
-        code, msg = 0, ""
-        while True:
-            op, data = self.ws.recv()
-            if op == self.ws.OP_CLOSE:
-                break
-            if not data:
-                continue
-            ch, payload = data[0], data[1:]
-            if ch in (1, 2):
-                if payload:
-                    self.put(payload)
-            elif ch == 3:
-                try:
-                    st = json.loads(payload)
-                    if st.get("status") == "Failure":
-                        causes = (st.get("details") or {}).get("causes") or []
-                        ec = next((c.get("message") for c in causes if c.get("reason") == "ExitCode"), None)
-                        code = int(ec) if ec and ec.isdigit() else 1
-                        if not ec:
-                            msg = st.get("message", "")
-                except ValueError:
-                    msg = payload.decode(errors="replace")
-        self.put(("exit", code, msg))
-
-    def write(self, data):
-        if self.ws and not self.ws.closed:
-            self.ws.send(b"\x00" + (data.encode("utf-8") if isinstance(data, str) else data))
-
-    def resize(self, cols, rows):
-        if self.ws and not self.ws.closed:
-            self.ws.send(b"\x04" + json.dumps({"Width": cols, "Height": rows}).encode())
-
-    def close(self):
-        if self.ws:
-            self.ws.close()
-
-
+            js = self.request("GET", "/api/v1/namespaces/openshift-config-managed/configmaps/console-public",
+                              timeout=15)
+            url = ((js.get("data") or {}).get("consoleURL") or "").rstrip("/")
+            if url.startswith("https://"):
+                return url
+        except KubeError:
+            pass
+        return fallback or (self.server + "/console" if self.flavor == "openshift" else "")
 
 
 # ======================================================================================
@@ -2465,33 +2268,6 @@ class DemoKube:
                 return o
         raise KubeError(f'HTTP 404 : {res["name"]} "{name}" not found', 404)
 
-    def delete(self, res, ns, name):
-        lst = self.store.get((res['name'], ns if res['namespaced'] else None), [])
-        self.store[(res['name'], ns if res['namespaced'] else None)] = [o for o in lst if o['metadata']['name'] != name]
-        if res['name'] == 'pods':  # le ReplicaSet recrée un pod
-            gone = next((o for o in lst if o['metadata']['name'] == name), None)
-            if gone and gone['metadata'].get('ownerReferences', [{}])[0].get('kind') == 'ReplicaSet':
-                new = dict(gone)
-                new['metadata'] = dict(gone['metadata'], name=name.rsplit('-', 1)[0] + '-' + _h(str(time.time())),
-                                       creationTimestamp=_dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
-                self._add('pods', ns, new)
-        return {}
-
-    def scale(self, res, ns, name, replicas):
-        o = self.get(res, ns, name)
-        o['spec']['replicas'] = int(replicas)
-        o.setdefault('status', {})['readyReplicas'] = min(int(replicas), o['status'].get('readyReplicas', 0) + int(replicas))
-        for lst in self.store.get((res['name'], ns), []):
-            if lst['metadata']['name'] == name:
-                lst['spec']['replicas'] = int(replicas)
-                lst['status']['readyReplicas'] = int(replicas)
-                lst['status']['availableReplicas'] = int(replicas)
-        return o
-
-    def restart(self, res, ns, name):
-        self._lat()
-        return {}
-
     def version(self):
         return 'v' + self.cluster['version'].split('_')[0]
 
@@ -2554,1002 +2330,17 @@ class DemoKube:
         names = [n['metadata']['name'] for n in self.list(CATALOG_BY_KEY['namespaces'])]
         return sorted(set(names) | {d for d in declared if d}), 'tous'
 
-    def exec_backend(self, ns, pod, container):
-        p = self.get({'group': '', 'version': 'v1', 'name': 'pods', 'namespaced': True}, ns, pod)
-        if p['status']['phase'] != 'Running':
-            raise KubeError(f'container not running ({p["status"]["phase"]})')
-        return DemoShellBackend(self, ns, pod, container)
+    console = "https://console-openshift-console.demo.example"
 
+    def find_console(self, fallback=""):
+        return self.console
 
-class DemoShellBackend:
-    """Shell simulé (édition de ligne, quelques commandes) pour le mode démonstration."""
-
-    FILES = {
-        '/app': ['app.jar', 'config', 'logs', 'start.sh'],
-        '/app/config': ['application.yaml', 'logback.xml'],
-        '/app/logs': ['app.log'],
-    }
-
-    def __init__(self, demo, ns, pod, container):
-        self.demo, self.ns, self.pod, self.container = demo, ns, pod, container
-        self.title = pod + (f' [{container}]' if container else '')
-        self.line = ''
-        self.cwd = '/app'
-        self.history, self.hidx = [], 0
-        self._esc = ''
-        self.exited = False
-        self.put = None
-
-    def start(self, cols, rows, put):
-        self.put = put
-        self._out(f'\x1b[90mConnexion au pod {self.ns}/{self.pod} (démo)…\x1b[0m\r\n')
-        self._out('\x1b[33mMode démonstration : shell simulé. Tape « help ».\x1b[0m\r\n')
-        self._prompt()
-
-    def _out(self, s):
-        self.put(s.encode('utf-8'))
-
-    def _prompt(self):
-        self._out(f'\x1b[1;32mroot@{self.pod[:30]}\x1b[0m:\x1b[1;34m{self.cwd}\x1b[0m# ')
-
-    def resize(self, cols, rows):
-        pass
-
-    def close(self):
-        self.exited = True
-
-    def write(self, data):
-        if self.exited:
-            return
-        text = data.decode('utf-8', 'replace') if isinstance(data, bytes) else data
-        if text.startswith('\x1b[200~'):          # collage « entre crochets » : on garde le texte
-            text = text.replace('\x1b[200~', '').replace('\x1b[201~', '')
-        for ch in text:
-            if self._esc or ch == '\x1b':
-                self._esc += ch
-                if len(self._esc) >= 3 or (len(self._esc) == 2 and self._esc[1] not in '[O'):
-                    self._arrow(self._esc)
-                    self._esc = ''
-                continue
-            if ch in '\r\n':
-                self._out('\r\n')
-                cmd, self.line = self.line.strip(), ''
-                if cmd:
-                    self.history.append(cmd)
-                self.hidx = len(self.history)
-                if self._run(cmd):
-                    return
-                self._prompt()
-            elif ch in '\x7f\x08':
-                if self.line:
-                    self.line = self.line[:-1]
-                    self._out('\b \b')
-            elif ch == '\x03':
-                self._out('^C\r\n')
-                self.line = ''
-                self._prompt()
-            elif ch == '\x04':
-                if not self.line:
-                    self._run('exit')
-                    return
-            elif ch == '\x0c':
-                self._out('\x1b[2J\x1b[H')
-                self._prompt()
-                self._out(self.line)
-            elif ch == '\t':
-                pass
-            elif ch >= ' ':
-                self.line += ch
-                self._out(ch)
-
-    def _arrow(self, seq):
-        if seq[-1] in 'AB' and self.history:
-            self.hidx = max(0, self.hidx - 1) if seq[-1] == 'A' else min(len(self.history), self.hidx + 1)
-            new = self.history[self.hidx] if self.hidx < len(self.history) else ''
-            self._out('\b \b' * len(self.line) + new)
-            self.line = new
-
-    def _run(self, cmd):
-        if not cmd:
-            return False
-        try:
-            argv = shlex.split(cmd)
-        except ValueError:
-            argv = cmd.split()
-        if not argv:
-            return False
-        c, args = argv[0], argv[1:]
-        o = self._out
-        if c in ('exit', 'logout'):
-            o('logout\r\n')
-            self.exited = True
-            self.put(('exit', 0, ''))
-            return True
-        if c == 'help':
-            o('Commandes simulées : ls, cd, pwd, cat, env, ps, top, df, hostname, whoami, date, uname, '
-              'curl, echo, clear, exit\r\n')
-        elif c == 'pwd':
-            o(self.cwd + '\r\n')
-        elif c == 'cd':
-            target = args[0] if args else '/app'
-            target = target if target.startswith('/') else (self.cwd.rstrip('/') + '/' + target)
-            target = '/app' if target in ('/app/..', '/app/.') else target.rstrip('/') or '/'
-            if target.startswith('/app/') and target.endswith('/..'):
-                target = target.rsplit('/', 2)[0] or '/'
-            if target in self.FILES or target == '/':
-                self.cwd = target
-            else:
-                o(f'sh: cd: {args[0]}: No such file or directory\r\n')
-        elif c == 'ls':
-            entries = self.FILES.get(self.cwd, ['app', 'bin', 'etc', 'home', 'proc', 'tmp', 'usr', 'var'])
-            o('  '.join(f'\x1b[1;34m{e}\x1b[0m' if (self.cwd.rstrip('/') + '/' + e) in self.FILES or '.' not in e else e
-                        for e in entries) + '\r\n')
-        elif c == 'cat':
-            name = args[0] if args else ''
-            if name.endswith('application.yaml'):
-                o('server:\r\n  port: 8080\r\nspring:\r\n  datasource:\r\n    url: jdbc:postgresql://db:5432/app\r\n'
-                  'management:\r\n  endpoints:\r\n    web:\r\n      exposure:\r\n        include: health,metrics\r\n')
-            elif name.endswith('app.log'):
-                for ln in self.demo.log_lines(self.pod, 8):
-                    o(ln + '\r\n')
-            elif name.endswith('start.sh'):
-                o('#!/bin/sh\r\nexec java -Xmx512m -jar /app/app.jar\r\n')
-            else:
-                o(f'cat: {name}: No such file or directory\r\n')
-        elif c == 'env':
-            for k, v in [('HOSTNAME', self.pod), ('KUBERNETES_SERVICE_HOST', '172.21.0.1'),
-                         ('KUBERNETES_SERVICE_PORT', '443'), ('JAVA_OPTS', '-Xmx512m'),
-                         ('SPRING_PROFILES_ACTIVE', self.ns), ('TZ', 'Europe/Paris'),
-                         ('PATH', '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')]:
-                o(f'{k}={v}\r\n')
-        elif c in ('ps', 'top'):
-            o('\x1b[7m  PID USER     %CPU %MEM COMMAND                          \x1b[0m\r\n')
-            o(f'    1 app      {random.uniform(1, 25):4.1f}  12.3 java -Xmx512m -jar /app/app.jar\r\n')
-            o('   42 app       0.0   0.1 /bin/sh\r\n')
-            o('   57 app       0.0   0.1 ps\r\n')
-        elif c == 'df':
-            o('Filesystem      Size  Used Avail Use% Mounted on\r\noverlay         100G   38G   62G  38% /\r\n'
-              'tmpfs            64M     0   64M   0% /dev\r\n/dev/vdb         10G  2.1G  7.9G  21% /data\r\n')
-        elif c == 'hostname':
-            o(self.pod + '\r\n')
-        elif c == 'whoami':
-            o('app\r\n')
-        elif c == 'date':
-            o(time.strftime('%a %b %d %H:%M:%S UTC %Y', time.gmtime()) + '\r\n')
-        elif c == 'uname':
-            o('Linux ' + self.pod + ' 5.14.0-427.el9.x86_64 #1 SMP x86_64 GNU/Linux\r\n' if args else 'Linux\r\n')
-        elif c == 'curl':
-            o('{"status":"UP","components":{"db":{"status":"UP"},"diskSpace":{"status":"UP"}}}\r\n')
-        elif c == 'echo':
-            o(' '.join(args) + '\r\n')
-        elif c == 'clear':
-            o('\x1b[2J\x1b[H')
-        else:
-            o(f'sh: {c}: command not found\r\n')
-        return False
-# ======================================================================================
-# Émulateur VT (xterm-256color)
-# ======================================================================================
-
-DEFAULT = -1
-BOLD, DIM, ITALIC, UNDERLINE, BLINK, REVERSE, HIDDEN, STRIKE = 1, 2, 4, 8, 16, 32, 64, 128
-TRUECOLOR = 1 << 24
-DEFAULT_ATTR = (DEFAULT, DEFAULT, 0)
-DEC_GRAPHICS = str.maketrans({
-    "`": "◆", "a": "▒", "b": "␉", "c": "␌", "d": "␍", "e": "␊", "f": "°", "g": "±", "h": "␤", "i": "␋",
-    "j": "┘", "k": "┐", "l": "┌", "m": "└", "n": "┼", "o": "⎺", "p": "⎻", "q": "─", "r": "⎼", "s": "⎽",
-    "t": "├", "u": "┤", "v": "┴", "w": "┬", "x": "│", "y": "≤", "z": "≥", "{": "π", "|": "≠", "}": "£",
-    "~": "·",
-})
-_CTRL = re.compile(r"[\x00-\x1f\x7f]")
-_CSI = re.compile(r"\x1b\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])")
-_CSI_PARTIAL = re.compile(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*\Z")
-_ANSI_STRIP = re.compile(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|"
-                         r"\x1b[@-Z\\-_()*+#%][0-9A-Za-z]?")
-
-
-def strip_ansi(s):
-    return _ANSI_STRIP.sub("", s)
-
-
-@lru_cache(maxsize=8192)
-def char_width(c):
-    o = ord(c)
-    if o < 0x300:
-        return 1
-    if unicodedata.combining(c) or unicodedata.category(c) in ("Mn", "Me", "Cf"):
-        return 0
-    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
-
-
-class Line:
-    __slots__ = ("chars", "attrs", "wrapped")
-
-    def __init__(self, cols, attr=DEFAULT_ATTR):
-        self.chars = [" "] * cols
-        self.attrs = [attr] * cols
-        self.wrapped = False
-
-    def resize(self, cols):
-        n = len(self.chars)
-        if cols > n:
-            self.chars.extend([" "] * (cols - n))
-            self.attrs.extend([DEFAULT_ATTR] * (cols - n))
-        elif cols < n:
-            del self.chars[cols:]
-            del self.attrs[cols:]
-
-    def text(self, start=0, end=None):
-        return "".join(self.chars[start:end]).rstrip()
-
-
-def _ints(s):
-    out = []
-    for p in s.split(";") if s else []:
-        head = p.split(":", 1)[0]
-        out.append(int(head) if head.isdigit() else 0)
-    return out
-
-
-class Screen:
-    def __init__(self, cols=80, rows=24, scrollback=10000):
-        self.cols, self.rows = max(2, cols), max(1, rows)
-        self.history = deque(maxlen=max(100, scrollback))
-        self.history_total = 0          # lignes passées dans l'historique depuis le début
-        self.history_resets = 0
-        self.write_back = lambda s: None
-        self.on_title = lambda t: None
-        self.on_bell = lambda: None
-        self.on_cwd = lambda p: None
-        self.color_query = None
-        self.title = ""
-        self._pending = ""
-        self._attr_cache = {DEFAULT_ATTR: DEFAULT_ATTR}
-        self.reset()
-
-    def reset(self):
-        self.main = [Line(self.cols) for _ in range(self.rows)]
-        self.alt = None
-        self.lines = self.main
-        self.alt_active = False
-        self.cx = self.cy = 0
-        self.wrap_pending = False
-        self.attr = DEFAULT_ATTR
-        self.top, self.bottom = 0, self.rows - 1
-        self.autowrap = True
-        self.origin = False
-        self.insert_mode = False
-        self.app_cursor = False
-        self.app_keypad = False
-        self.bracketed_paste = False
-        self.cursor_visible = True
-        self.reverse_video = False
-        self.lnm = False
-        self.mouse_mode = 0
-        self.mouse_sgr = False
-        self.focus_events = False
-        self.cursor_style = 0
-        self.g = ["B", "B"]
-        self.gl = 0
-        self.saved = None
-        self.tabs = set(range(8, self.cols, 8))
-        self.last_char = " "
-        self.changed = True
-
-    def _intern(self, t):
-        return self._attr_cache.setdefault(t, t)
-
-    def _blank_attr(self):
-        bg = self.attr[1]
-        return DEFAULT_ATTR if bg == DEFAULT else self._intern((DEFAULT, bg, 0))
-
-    def _new_line(self):
-        return Line(self.cols, self._blank_attr())
-
-    # ---- défilement
-    def scroll_up(self, n=1, top=None, bottom=None, to_history=True):
-        top = self.top if top is None else top
-        bottom = self.bottom if bottom is None else bottom
-        n = min(n, bottom - top + 1)
-        if n <= 0:
-            return
-        removed = self.lines[top:top + n]
-        del self.lines[top:top + n]
-        self.lines[bottom - n + 1:bottom - n + 1] = [self._new_line() for _ in range(n)]
-        if to_history and top == 0 and not self.alt_active:
-            self.history.extend(removed)
-            self.history_total += n
-        self.changed = True
-
-    def scroll_down(self, n=1, top=None, bottom=None):
-        top = self.top if top is None else top
-        bottom = self.bottom if bottom is None else bottom
-        n = min(n, bottom - top + 1)
-        if n <= 0:
-            return
-        del self.lines[bottom - n + 1:bottom + 1]
-        self.lines[top:top] = [self._new_line() for _ in range(n)]
-        self.changed = True
-
-    def index(self):
-        if self.cy == self.bottom:
-            self.scroll_up(1)
-        elif self.cy < self.rows - 1:
-            self.cy += 1
-
-    def reverse_index(self):
-        if self.cy == self.top:
-            self.scroll_down(1)
-        elif self.cy > 0:
-            self.cy -= 1
-
-    def linefeed(self):
-        self.wrap_pending = False
-        self.index()
-        if self.lnm:
-            self.cx = 0
-
-    # ---- texte
-    def _wrap(self):
-        self.wrap_pending = False
-        self.lines[self.cy].wrapped = True
-        self.cx = 0
-        self.index()
-
-    def put_text(self, s):
-        if not s:
-            return
-        if self.g[self.gl] == "0":
-            s = s.translate(DEC_GRAPHICS)
-        self.last_char = s[-1]
-        self.changed = True
-        i, n, cols, attr = 0, len(s), self.cols, self.attr
-        while i < n:
-            if self.wrap_pending and self.autowrap:
-                self._wrap()
-            line = self.lines[self.cy]
-            chars, attrs = line.chars, line.attrs
-            x = self.cx
-            chunk = s[i:i + cols - x]
-            if chunk.isascii() and not self.insert_mode:
-                k = len(chunk)
-                if x > 0 and chars[x] == "":
-                    chars[x - 1] = " "
-                chars[x:x + k] = chunk
-                attrs[x:x + k] = [attr] * k
-                if x + k < cols and chars[x + k] == "":
-                    chars[x + k] = " "
-                i += k
-                if x + k >= cols:
-                    self.cx = cols - 1
-                    self.wrap_pending = self.autowrap
-                    if not self.autowrap and i < n:
-                        chars[cols - 1] = s[n - 1]
-                        i = n
-                else:
-                    self.cx = x + k
-                continue
-            c = s[i]
-            i += 1
-            w = char_width(c)
-            if w == 0:
-                px = self.cx if self.wrap_pending else self.cx - 1
-                if px >= 0:
-                    if chars[px] == "" and px > 0:
-                        px -= 1
-                    chars[px] += c
-                continue
-            if w == 2 and self.cx >= cols - 1:
-                if not self.autowrap:
-                    continue
-                chars[cols - 1] = " "
-                self._wrap()
-                line = self.lines[self.cy]
-                chars, attrs = line.chars, line.attrs
-            x = self.cx
-            if self.insert_mode:
-                chars[x:x] = [" "] * w
-                attrs[x:x] = [self._blank_attr()] * w
-                del chars[cols:]
-                del attrs[cols:]
-            if chars[x] == "" and x > 0:
-                chars[x - 1] = " "
-            chars[x] = c
-            attrs[x] = attr
-            if w == 2:
-                chars[x + 1] = ""
-                attrs[x + 1] = attr
-            elif x + 1 < cols and chars[x + 1] == "":
-                chars[x + 1] = " "
-            x += w
-            if x >= cols:
-                self.cx = cols - 1
-                self.wrap_pending = self.autowrap
-            else:
-                self.cx = x
-
-    # ---- analyse du flux
-    def feed(self, data):
-        if self._pending:
-            data = self._pending + data
-            self._pending = ""
-        i, n = 0, len(data)
-        ctrl = _CTRL.search
-        while i < n:
-            m = ctrl(data, i)
-            if m is None:
-                self.put_text(data[i:])
-                break
-            j = m.start()
-            if j > i:
-                self.put_text(data[i:j])
-            c = data[j]
-            if c != "\x1b":
-                self.control(c)
-                i = j + 1
-                continue
-            if j + 1 >= n:
-                self._pending = data[j:]
-                break
-            c2 = data[j + 1]
-            if c2 == "[":
-                mm = _CSI.match(data, j)
-                if mm:
-                    self.csi(mm.group(1), mm.group(2), mm.group(3))
-                    i = mm.end()
-                    continue
-                if _CSI_PARTIAL.match(data, j):
-                    if n - j < 512:
-                        self._pending = data[j:]
-                    break
-                i = j + 2
-                continue
-            if c2 in "]P_^X":
-                end, tlen = self._find_st(data, j + 2)
-                if end < 0:
-                    if n - j < 65536:
-                        self._pending = data[j:]
-                    break
-                if c2 == "]":
-                    self.osc(data[j + 2:end])
-                i = end + tlen
-                continue
-            if c2 in "()*+-./#% ":
-                if j + 2 >= n:
-                    self._pending = data[j:]
-                    break
-                if c2 in "()*+":
-                    self.g["()*+".index(c2) & 1] = data[j + 2]
-                elif c2 == "#" and data[j + 2] == "8":
-                    for line in self.lines:
-                        line.chars[:] = ["E"] * self.cols
-                        line.attrs[:] = [DEFAULT_ATTR] * self.cols
-                    self.changed = True
-                i = j + 3
-                continue
-            self.esc(c2)
-            i = j + 2
-
-    @staticmethod
-    def _find_st(data, start):
-        bel = data.find("\x07", start)
-        st = data.find("\x1b\\", start)
-        if bel < 0 and st < 0:
-            return -1, 0
-        if st < 0 or (0 <= bel < st):
-            return bel, 1
-        return st, 2
-
-    def control(self, c):
-        self.changed = True
-        if c == "\r":
-            self.cx = 0
-            self.wrap_pending = False
-        elif c in "\n\x0b\x0c":
-            self.linefeed()
-        elif c == "\x08":
-            if self.wrap_pending:
-                self.wrap_pending = False
-            elif self.cx > 0:
-                self.cx -= 1
-        elif c == "\t":
-            self.wrap_pending = False
-            nxt = [t for t in self.tabs if t > self.cx]
-            self.cx = min(min(nxt) if nxt else self.cols - 1, self.cols - 1)
-        elif c == "\x07":
-            self.on_bell()
-        elif c == "\x0e":
-            self.gl = 1
-        elif c == "\x0f":
-            self.gl = 0
-
-    def esc(self, c):
-        self.changed = True
-        if c == "7":
-            self.save_cursor()
-        elif c == "8":
-            self.restore_cursor()
-        elif c == "D":
-            self.wrap_pending = False
-            self.index()
-        elif c == "E":
-            self.cx = 0
-            self.linefeed()
-        elif c == "M":
-            self.wrap_pending = False
-            self.reverse_index()
-        elif c == "H":
-            self.tabs.add(self.cx)
-        elif c == "c":
-            self.reset()
-        elif c == "=":
-            self.app_keypad = True
-        elif c == ">":
-            self.app_keypad = False
-
-    def save_cursor(self):
-        self.saved = (self.cx, self.cy, self.attr, self.origin, self.wrap_pending, list(self.g), self.gl)
-
-    def restore_cursor(self):
-        if self.saved is None:
-            self.cx = self.cy = 0
-            self.attr = DEFAULT_ATTR
-            return
-        self.cx, self.cy, self.attr, self.origin, self.wrap_pending, g, self.gl = self.saved
-        self.g = list(g)
-        self.cx = min(self.cx, self.cols - 1)
-        self.cy = min(self.cy, self.rows - 1)
-
-    def _set_alt(self, on, save):
-        if on == self.alt_active:
-            return
-        if on:
-            if save:
-                self.save_cursor()
-            self.alt = [Line(self.cols) for _ in range(self.rows)]
-            self.lines = self.alt
-            self.alt_active = True
-        else:
-            self.lines = self.main
-            self.alt = None
-            self.alt_active = False
-            if save:
-                self.restore_cursor()
-        self.changed = True
-
-    def csi(self, params, inter, final):
-        self.changed = True
-        private = ""
-        if params and params[0] in "?><=":
-            private, params = params[0], params[1:]
-        if final == "m" and not private and not inter:
-            self.sgr(params.split(";") if params else [])
-            return
-        nums = _ints(params)
-
-        def p(i=0, d=1):
-            v = nums[i] if i < len(nums) else 0
-            return v if v else d
-
-        rows, cols = self.rows, self.cols
-        if inter:
-            if inter == " " and final == "q":
-                self.cursor_style = p(0, 0)
-            elif inter == "!" and final == "p":
-                self._soft_reset()
-            return
-        if private == "?":
-            if final in "hl":
-                self._dec_modes(nums, final == "h")
-            elif final == "n" and p(0, 0) == 6:
-                self.write_back(f"\x1b[?{self.cy + 1};{self.cx + 1}R")
-            return
-        if private == ">":
-            if final == "c":
-                self.write_back("\x1b[>0;10;1c")
-            return
-        if private:
-            return
-        if final not in "mnctr":
-            self.wrap_pending = False
-        if final in "Hf":
-            r, c = p(0) - 1, p(1) - 1
-            if self.origin:
-                r = min(r + self.top, self.bottom)
-            self.cy = max(0, min(rows - 1, r))
-            self.cx = max(0, min(cols - 1, c))
-        elif final == "K":
-            self.erase_line(p(0, 0))
-        elif final == "J":
-            self.erase_display(p(0, 0))
-        elif final == "A":
-            lim = self.top if self.cy >= self.top else 0
-            self.cy = max(lim, self.cy - p())
-        elif final in "Be":
-            lim = self.bottom if self.cy <= self.bottom else rows - 1
-            self.cy = min(lim, self.cy + p())
-        elif final in "Ca":
-            self.cx = min(cols - 1, self.cx + p())
-        elif final == "D":
-            self.cx = max(0, self.cx - p())
-        elif final == "E":
-            lim = self.bottom if self.cy <= self.bottom else rows - 1
-            self.cy, self.cx = min(lim, self.cy + p()), 0
-        elif final == "F":
-            lim = self.top if self.cy >= self.top else 0
-            self.cy, self.cx = max(lim, self.cy - p()), 0
-        elif final in "G`":
-            self.cx = max(0, min(cols - 1, p() - 1))
-        elif final == "d":
-            r = p() - 1 + (self.top if self.origin else 0)
-            self.cy = max(0, min(rows - 1, r))
-        elif final == "X":
-            n = min(p(), cols - self.cx)
-            line = self.lines[self.cy]
-            line.chars[self.cx:self.cx + n] = [" "] * n
-            line.attrs[self.cx:self.cx + n] = [self._blank_attr()] * n
-        elif final == "@":
-            n = min(p(), cols - self.cx)
-            line = self.lines[self.cy]
-            line.chars[self.cx:self.cx] = [" "] * n
-            line.attrs[self.cx:self.cx] = [self._blank_attr()] * n
-            del line.chars[cols:]
-            del line.attrs[cols:]
-        elif final == "P":
-            n = min(p(), cols - self.cx)
-            line = self.lines[self.cy]
-            del line.chars[self.cx:self.cx + n]
-            del line.attrs[self.cx:self.cx + n]
-            line.chars.extend([" "] * n)
-            line.attrs.extend([self._blank_attr()] * n)
-        elif final == "L":
-            if self.top <= self.cy <= self.bottom:
-                self.scroll_down(p(), self.cy, self.bottom)
-                self.cx = 0
-        elif final == "M":
-            if self.top <= self.cy <= self.bottom:
-                self.scroll_up(p(), self.cy, self.bottom, to_history=False)
-                self.cx = 0
-        elif final == "S":
-            self.scroll_up(p(), to_history=False)
-        elif final == "T":
-            self.scroll_down(p())
-        elif final == "r":
-            t, b = p(0) - 1, min(p(1, rows), rows) - 1
-            if t < b:
-                self.top, self.bottom = t, b
-                self.cx = 0
-                self.cy = self.top if self.origin else 0
-        elif final == "b":
-            self.put_text(self.last_char * min(p(), 65535))
-        elif final == "c":
-            if p(0, 0) == 0:
-                self.write_back("\x1b[?62;22c")
-        elif final == "n":
-            v = p(0, 0)
-            if v == 5:
-                self.write_back("\x1b[0n")
-            elif v == 6:
-                r = self.cy - (self.top if self.origin else 0)
-                self.write_back(f"\x1b[{r + 1};{self.cx + 1}R")
-        elif final in "hl":
-            on = final == "h"
-            for v in nums:
-                if v == 4:
-                    self.insert_mode = on
-                elif v == 20:
-                    self.lnm = on
-        elif final == "g":
-            v = p(0, 0)
-            if v == 0:
-                self.tabs.discard(self.cx)
-            elif v == 3:
-                self.tabs.clear()
-        elif final == "I":
-            for _ in range(p()):
-                self.control("\t")
-        elif final == "Z":
-            for _ in range(p()):
-                prv = [t for t in self.tabs if t < self.cx]
-                self.cx = max(prv) if prv else 0
-        elif final == "s":
-            if not params:
-                self.save_cursor()
-        elif final == "u":
-            self.restore_cursor()
-        elif final == "t":
-            if p(0, 0) == 18:
-                self.write_back(f"\x1b[8;{rows};{cols}t")
-
-    def _soft_reset(self):
-        self.attr = DEFAULT_ATTR
-        self.insert_mode = self.origin = self.app_cursor = False
-        self.autowrap = self.cursor_visible = True
-        self.top, self.bottom = 0, self.rows - 1
-        self.g, self.gl = ["B", "B"], 0
-
-    def _dec_modes(self, nums, on):
-        for v in nums:
-            if v == 1:
-                self.app_cursor = on
-            elif v == 5:
-                self.reverse_video = on
-            elif v == 6:
-                self.origin = on
-                self.cx, self.cy = 0, (self.top if on else 0)
-            elif v == 7:
-                self.autowrap = on
-            elif v == 25:
-                self.cursor_visible = on
-            elif v in (47, 1047):
-                self._set_alt(on, save=False)
-            elif v == 1048:
-                self.save_cursor() if on else self.restore_cursor()
-            elif v == 1049:
-                self._set_alt(on, save=True)
-            elif v == 2004:
-                self.bracketed_paste = on
-            elif v in (9, 1000, 1002, 1003):
-                self.mouse_mode = v if on else 0
-            elif v == 1006:
-                self.mouse_sgr = on
-            elif v == 1004:
-                self.focus_events = on
-
-    def erase_line(self, mode):
-        line = self.lines[self.cy]
-        blank = self._blank_attr()
-        a, b = {0: (self.cx, self.cols), 1: (0, self.cx + 1)}.get(mode, (0, self.cols))
-        line.chars[a:b] = [" "] * (b - a)
-        line.attrs[a:b] = [blank] * (b - a)
-        if mode != 1:
-            line.wrapped = False
-
-    def erase_display(self, mode):
-        if mode == 3:
-            self.history.clear()
-            self.history_resets += 1
-            return
-        if mode == 0:
-            self.erase_line(0)
-            rng = range(self.cy + 1, self.rows)
-        elif mode == 1:
-            self.erase_line(1)
-            rng = range(0, self.cy)
-        else:
-            rng = range(self.rows)
-        for r in rng:
-            self.lines[r] = self._new_line()
-
-    def sgr(self, parts):
-        fg, bg, fl = self.attr
-        if not parts:
-            parts = ["0"]
-        i, n = 0, len(parts)
-        while i < n:
-            part = parts[i]
-            if ":" in part:
-                sub = [int(x) if x.isdigit() else 0 for x in part.split(":")]
-                code = sub[0]
-                if code in (38, 48) and len(sub) >= 2:
-                    col = None
-                    if sub[1] == 5 and len(sub) >= 3:
-                        col = sub[2] & 255
-                    elif sub[1] == 2 and len(sub) >= 5:
-                        r, g, b = sub[-3:]
-                        col = TRUECOLOR | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255)
-                    if col is not None:
-                        if code == 38:
-                            fg = col
-                        else:
-                            bg = col
-                elif code == 4:
-                    fl = (fl | UNDERLINE) if (len(sub) < 2 or sub[1]) else (fl & ~UNDERLINE)
-                i += 1
-                continue
-            code = int(part) if part.isdigit() else 0
-            if code == 0:
-                fg = bg = DEFAULT
-                fl = 0
-            elif code == 1:
-                fl |= BOLD
-            elif code == 2:
-                fl |= DIM
-            elif code == 3:
-                fl |= ITALIC
-            elif code in (4, 21):
-                fl |= UNDERLINE
-            elif code in (5, 6):
-                fl |= BLINK
-            elif code == 7:
-                fl |= REVERSE
-            elif code == 8:
-                fl |= HIDDEN
-            elif code == 9:
-                fl |= STRIKE
-            elif code == 22:
-                fl &= ~(BOLD | DIM)
-            elif code == 23:
-                fl &= ~ITALIC
-            elif code == 24:
-                fl &= ~UNDERLINE
-            elif code == 25:
-                fl &= ~BLINK
-            elif code == 27:
-                fl &= ~REVERSE
-            elif code == 28:
-                fl &= ~HIDDEN
-            elif code == 29:
-                fl &= ~STRIKE
-            elif 30 <= code <= 37:
-                fg = code - 30
-            elif code == 39:
-                fg = DEFAULT
-            elif 40 <= code <= 47:
-                bg = code - 40
-            elif code == 49:
-                bg = DEFAULT
-            elif 90 <= code <= 97:
-                fg = code - 90 + 8
-            elif 100 <= code <= 107:
-                bg = code - 100 + 8
-            elif code in (38, 48):
-                col = None
-                if i + 2 < n and parts[i + 1] == "5":
-                    col = int(parts[i + 2] or 0) & 255
-                    i += 2
-                elif i + 4 < n and parts[i + 1] == "2":
-                    r, g, b = (int(x or 0) & 255 for x in parts[i + 2:i + 5])
-                    col = TRUECOLOR | (r << 16) | (g << 8) | b
-                    i += 4
-                if col is not None:
-                    if code == 38:
-                        fg = col
-                    else:
-                        bg = col
-            i += 1
-        self.attr = self._intern((fg, bg, fl))
-
-    def osc(self, s):
-        code, _, rest = s.partition(";")
-        if code in ("0", "2"):
-            self.title = rest
-            self.on_title(rest)
-        elif code == "7":
-            self.on_cwd(re.sub(r"^file://[^/]*", "", rest))
-        elif code in ("10", "11", "12") and rest == "?" and self.color_query:
-            kind = {"10": "fg", "11": "bg", "12": "cursor"}[code]
-            self.write_back(f"\x1b]{code};{_xcolor(self.color_query(kind))}\x1b\\")
-        elif code == "4" and self.color_query:
-            idx, _, q = rest.partition(";")
-            if q == "?" and idx.isdigit():
-                self.write_back(f"\x1b]4;{idx};{_xcolor(self.color_query(int(idx)))}\x1b\\")
-
-    def resize(self, cols, rows):
-        cols, rows = max(2, cols), max(1, rows)
-        if cols == self.cols and rows == self.rows:
-            return
-        for buf in (self.main, self.alt):
-            if buf is not None:
-                for line in buf:
-                    line.resize(cols)
-        if rows < self.rows:
-            diff = self.rows - rows
-            for buf in (self.main, self.alt):
-                if buf is None:
-                    continue
-                active = buf is self.lines
-                below = (self.rows - 1 - self.cy) if active else diff
-                from_bottom = min(diff, max(0, below))
-                if from_bottom:
-                    del buf[len(buf) - from_bottom:]
-                from_top = diff - from_bottom
-                if from_top:
-                    removed = buf[:from_top]
-                    del buf[:from_top]
-                    if buf is self.main:
-                        self.history.extend(removed)
-                        self.history_total += from_top
-                    if active:
-                        self.cy -= from_top
-        elif rows > self.rows:
-            for buf in (self.main, self.alt):
-                if buf is not None:
-                    buf.extend(Line(cols) for _ in range(rows - self.rows))
-        self.cols, self.rows = cols, rows
-        self.top, self.bottom = 0, rows - 1
-        self.tabs = set(range(8, cols, 8))
-        self.cx = max(0, min(cols - 1, self.cx))
-        self.cy = max(0, min(rows - 1, self.cy))
-        self.wrap_pending = False
-        self.changed = True
-
-    # ---- lecture
-    def first_abs(self):
-        """Numéro absolu de la plus ancienne ligne encore en mémoire."""
-        return self.history_total - len(self.history)
-
-    def line_at(self, abs_row):
-        """Ligne au numéro absolu (historique puis écran), ou None."""
-        k = abs_row - self.first_abs()
-        if 0 <= k < len(self.history):
-            return self.history[k]
-        r = abs_row - self.history_total
-        if 0 <= r < self.rows:
-            return self.lines[r]
-        return None
-
-    def text_from(self, abs_row, col):
-        """Texte affiché entre une position (ligne absolue, colonne) et le curseur."""
-        end_abs = self.history_total + self.cy
-        end_col = self.cols if self.wrap_pending else self.cx
-        out = []
-        for r in range(abs_row, end_abs + 1):
-            line = self.line_at(r)
-            if line is None:
-                continue
-            a = col if r == abs_row else 0
-            b = end_col if r == end_abs else self.cols
-            part = "".join(line.chars[a:b])
-            if r < end_abs and not line.wrapped:
-                part = part.rstrip() + "\n"
-            out.append(part)
-        return "".join(out)
-
-    def prompt_text(self, max_rows=8):
-        """Ce qui est écrit avant le curseur sur la ligne en cours (pour les réponses automatiques).
-        Une invite trop longue pour la fenêtre est coupée sur plusieurs lignes : on la recolle."""
-        line = self.lines[self.cy]
-        end = self.cols if self.wrap_pending else self.cx
-        parts = ["".join(line.chars[:end])]
-        r = self.history_total + self.cy - 1
-        while len(parts) < max_rows:
-            prev = self.line_at(r)
-            if prev is None or not prev.wrapped:
-                break
-            parts.append("".join(prev.chars[:self.cols]))
-            r -= 1
-        return "".join(reversed(parts))
-
-    def line_above_text(self, max_rows=8):
-        """Ligne complète juste au-dessus de la ligne du curseur (lignes coupées recollées).
-        Sert quand une passerelle termine sa question par un retour à la ligne :
-        « …for this operation:⏎ » laisse le curseur au début d'une ligne vide."""
-        r = self.history_total + self.cy
-        while True:                                   # début de la ligne du curseur
-            prev = self.line_at(r - 1)
-            if prev is None or not prev.wrapped:
-                break
-            r -= 1
-        end = r - 1
-        line = self.line_at(end)
-        if line is None:
-            return ""
-        parts = ["".join(line.chars[:self.cols])]
-        r = end - 1
-        while len(parts) < max_rows:
-            prev = self.line_at(r)
-            if prev is None or not prev.wrapped:
-                break
-            parts.append("".join(prev.chars[:self.cols]))
-            r -= 1
-        return "".join(reversed(parts)).rstrip()
-
-    def display_text(self):
-        return "\n".join(line.text() for line in self.lines)
-
-
-def _xcolor(hexcol):
-    h = hexcol.lstrip("#")
-    if len(h) != 6:
-        h = "000000"
-    return f"rgb:{h[0:2]}{h[0:2]}/{h[2:4]}{h[2:4]}/{h[4:6]}{h[4:6]}"
 
 # ======================================================================================
 # Qt (uniquement QtCore, QtGui et QtWidgets)
 # ======================================================================================
 
-from PySide6.QtCore import (QByteArray, QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize,  # noqa: E402
+from PySide6.QtCore import (QByteArray, QEvent, QObject, QPoint, QPointF, QRectF, QSize,  # noqa: E402
                             Qt, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QFont, QFontDatabase,  # noqa: E402
                            QFontMetricsF, QGuiApplication, QIcon, QKeySequence, QPainter, QPainterPath, QPalette,
@@ -3558,66 +2349,14 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # no
                                QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
-                               QPushButton, QScrollArea, QScrollBar, QSpinBox, QSplitter,
+                               QPushButton, QScrollArea, QSplitter,
                                QStackedWidget, QTabBar, QTabWidget, QTextEdit, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 
-
 # ======================================================================================
-# Terminal des pods (moteur de Terminal Pro : même émulateur, même affichage, même clavier)
+# Outils communs de l'interface
 # ======================================================================================
-
-SCHEMES = {
-    "Campbell": {"background": "#0C0C0C", "foreground": "#CCCCCC", "cursor": "#FFFFFF", "selection": "#FFFFFF",
-                 "colors": ["#0C0C0C", "#C50F1F", "#13A10E", "#C19C00", "#0037DA", "#881798", "#3A96DD",
-                            "#CCCCCC", "#767676", "#E74856", "#16C60C", "#F9F1A5", "#3B78FF", "#B4009E",
-                            "#61D6D6", "#F2F2F2"]},
-    "Campbell PowerShell": {"background": "#012456", "foreground": "#CCCCCC", "cursor": "#FFFFFF",
-                            "selection": "#FFFFFF",
-                            "colors": ["#0C0C0C", "#C50F1F", "#13A10E", "#C19C00", "#0037DA", "#881798",
-                                       "#3A96DD", "#CCCCCC", "#767676", "#E74856", "#16C60C", "#F9F1A5",
-                                       "#3B78FF", "#B4009E", "#61D6D6", "#F2F2F2"]},
-    "One Half Dark": {"background": "#282C34", "foreground": "#DCDFE4", "cursor": "#FFFFFF", "selection": "#FFFFFF",
-                      "colors": ["#282C34", "#E06C75", "#98C379", "#E5C07B", "#61AFEF", "#C678DD", "#56B6C2",
-                                 "#DCDFE4", "#5A6374", "#E06C75", "#98C379", "#E5C07B", "#61AFEF", "#C678DD",
-                                 "#56B6C2", "#DCDFE4"]},
-    "One Half Light": {"background": "#FAFAFA", "foreground": "#383A42", "cursor": "#4F525D",
-                       "selection": "#4F525D",
-                       "colors": ["#383A42", "#E45649", "#50A14F", "#C18401", "#0184BC", "#A626A4", "#0997B3",
-                                  "#FAFAFA", "#4F525D", "#DF6C75", "#98C379", "#E4C07A", "#61AFEF", "#C577DD",
-                                  "#56B5C1", "#FFFFFF"]},
-    "Tango Dark": {"background": "#000000", "foreground": "#D3D7CF", "cursor": "#FFFFFF", "selection": "#FFFFFF",
-                   "colors": ["#000000", "#CC0000", "#4E9A06", "#C4A000", "#3465A4", "#75507B", "#06989A",
-                              "#D3D7CF", "#555753", "#EF2929", "#8AE234", "#FCE94F", "#729FCF", "#AD7FA8",
-                              "#34E2E2", "#EEEEEC"]},
-    "Solarized Dark": {"background": "#002B36", "foreground": "#839496", "cursor": "#FFFFFF", "selection": "#FFFFFF",
-                       "colors": ["#002B36", "#DC322F", "#859900", "#B58900", "#268BD2", "#D33682", "#2AA198",
-                                  "#EEE8D5", "#073642", "#CB4B16", "#586E75", "#657B83", "#839496", "#6C71C4",
-                                  "#93A1A1", "#FDF6E3"]},
-    "Vintage": {"background": "#000000", "foreground": "#C0C0C0", "cursor": "#FFFFFF", "selection": "#FFFFFF",
-                "colors": ["#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080", "#C0C0C0",
-                           "#808080", "#FF0000", "#00FF00", "#FFFF00", "#0000FF", "#FF00FF", "#00FFFF",
-                           "#FFFFFF"]},
-}
-
-
-def build_palette(scheme):
-    pal = [QColor(c) for c in scheme["colors"]]
-    levels = [0, 95, 135, 175, 215, 255]
-    for r in range(6):
-        for g in range(6):
-            for b in range(6):
-                pal.append(QColor(levels[r], levels[g], levels[b]))
-    pal += [QColor(8 + i * 10, 8 + i * 10, 8 + i * 10) for i in range(24)]
-    return pal
-
-
-def blend(c1, c2, t):
-    a, b = QColor(c1), QColor(c2)
-    return QColor(round(a.red() + (b.red() - a.red()) * t), round(a.green() + (b.green() - a.green()) * t),
-                  round(a.blue() + (b.blue() - a.blue()) * t))
-
 
 def mono_font(family="", size=13):
     families = set(QFontDatabase.families())
@@ -3667,7 +2406,7 @@ def run_async(fn, callback):
     def work():
         try:
             res, err = fn(), None
-        except (CloudError, KubeError, NetError, WSError) as exc:
+        except (CloudError, KubeError, NetError) as exc:
             res, err = None, err_text(exc)
         except Exception as exc:  # noqa: BLE001
             res, err = None, ErrText(f"{type(exc).__name__} : {exc}")
@@ -3681,874 +2420,6 @@ def confirm(parent, title, text, ok="Oui"):
     box.setDefaultButton(QMessageBox.StandardButton.Cancel)
     box.exec()
     return box.clickedButton() is yes
-
-
-def confirm_danger(parent, title, text, ok="Supprimer"):
-    """Comme confirm, avec l'icône d'avertissement ; « Annuler » reste le bouton par défaut."""
-    box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.Cancel, parent)
-    yes = box.addButton(ok, QMessageBox.ButtonRole.DestructiveRole)
-    box.setDefaultButton(QMessageBox.StandardButton.Cancel)
-    box.exec()
-    return box.clickedButton() is yes
-
-
-class PodSession(QObject):
-    """Session de terminal dans un pod. Le « backend » (WebSocket réel ou shell de démo) dépose ce qu'il reçoit
-    dans une file ; un minuteur la vide dans l'émulateur, dans le fil de l'interface."""
-    output = Signal()
-    title_changed = Signal(str)
-    exited = Signal(int)
-    notify = Signal(str, str)
-
-    def __init__(self, factory, title, scrollback=10000):
-        super().__init__()
-        self.factory = factory              # factory() -> backend ; appelé à chaque (re)connexion
-        self.title = title
-        self.screen = Screen(80, 24, scrollback)
-        self.screen.write_back = self.write
-        self.screen.on_title = self._on_title
-        self.screen.on_bell = lambda: QApplication.beep()
-        self.backend = None
-        self.started = False
-        self.running = False
-        self.exit_code = None
-        self.queue = queue.Queue()
-        self._decoder = None
-        self._pump = QTimer(self)
-        self._pump.setInterval(15)
-        self._pump.timeout.connect(self._drain)
-
-    def start(self, cols, rows):
-        import codecs
-        self.screen.resize(cols, rows)
-        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        self.exit_code = None
-        self.started = True
-        q = self.queue = queue.Queue()      # une file par connexion : l'ancienne ne déborde jamais sur la nouvelle
-        try:
-            self.backend = self.factory()
-        except Exception as exc:  # noqa: BLE001
-            self.screen.feed(f"\x1b[91m[Erreur] {exc}\x1b[0m\r\n")
-            self.running = False
-            self.exit_code = -1
-            self.output.emit()
-            QTimer.singleShot(0, lambda: self.exited.emit(-1))
-            return
-        self.running = True
-        self._pump.start()
-        self.backend.start(cols, rows, q.put)
-
-    def restart(self):
-        self.screen.feed("\r\n")
-        self.start(self.screen.cols, self.screen.rows)
-        self.output.emit()
-
-    def close(self):
-        self.running = False
-        self._pump.stop()
-        if self.backend is not None:
-            try:
-                self.backend.close()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _drain(self):
-        changed = False
-        budget = 262144
-        while budget > 0:
-            try:
-                item = self.queue.get_nowait()
-            except queue.Empty:
-                break
-            if isinstance(item, tuple):                 # ("exit", code, message)
-                tail = self._decoder.decode(b"", final=True)
-                if tail:
-                    self.screen.feed(tail)
-                code = item[1]
-                msg = item[2] if len(item) > 2 else ""
-                if msg:
-                    self.screen.feed(f"\r\n\x1b[91m{msg}\x1b[0m\r\n")
-                self.running = False
-                self.exit_code = code
-                self._pump.stop()
-                self.output.emit()
-                self.exited.emit(code)
-                return
-            budget -= len(item)
-            text = self._decoder.decode(item)
-            if text:
-                self.screen.feed(text)
-                changed = True
-        if changed:
-            self.output.emit()
-
-    def write(self, data):
-        if self.backend is None or not self.running:
-            return
-        self.backend.write(data.encode("utf-8") if isinstance(data, str) else data)
-
-    def paste(self, text):
-        text = text.replace("\r\n", "\r").replace("\n", "\r")
-        if self.screen.bracketed_paste:
-            text = "\x1b[200~" + text.replace("\x1b[201~", "") + "\x1b[201~"
-        self.write(text)
-
-    def resize(self, cols, rows):
-        if cols == self.screen.cols and rows == self.screen.rows:
-            return
-        self.screen.resize(cols, rows)
-        if self.backend is not None and self.running:
-            self.backend.resize(cols, rows)
-
-    def user_typed(self):
-        pass
-
-    def _on_title(self, t):
-        self.title = t
-        self.title_changed.emit(t)
-
-
-_CURSOR_KEYS = {Qt.Key.Key_Up: "A", Qt.Key.Key_Down: "B", Qt.Key.Key_Right: "C", Qt.Key.Key_Left: "D",
-                Qt.Key.Key_Home: "H", Qt.Key.Key_End: "F"}
-_TILDE_KEYS = {Qt.Key.Key_Insert: 2, Qt.Key.Key_Delete: 3, Qt.Key.Key_PageUp: 5, Qt.Key.Key_PageDown: 6,
-               Qt.Key.Key_F5: 15, Qt.Key.Key_F6: 17, Qt.Key.Key_F7: 18, Qt.Key.Key_F8: 19, Qt.Key.Key_F9: 20,
-               Qt.Key.Key_F10: 21, Qt.Key.Key_F11: 23, Qt.Key.Key_F12: 24}
-_SS3_KEYS = {Qt.Key.Key_F1: "P", Qt.Key.Key_F2: "Q", Qt.Key.Key_F3: "R", Qt.Key.Key_F4: "S"}
-_CTRL_SPECIAL = {Qt.Key.Key_Space: "\x00", Qt.Key.Key_At: "\x00", Qt.Key.Key_2: "\x00",
-                 Qt.Key.Key_BracketLeft: "\x1b", Qt.Key.Key_Backslash: "\x1c", Qt.Key.Key_BracketRight: "\x1d",
-                 Qt.Key.Key_AsciiCircum: "\x1e", Qt.Key.Key_6: "\x1e", Qt.Key.Key_Underscore: "\x1f",
-                 Qt.Key.Key_Minus: "\x1f", Qt.Key.Key_Slash: "\x1f", Qt.Key.Key_Question: "\x7f"}
-# Sur Mac, Qt appelle « Control » la touche Cmd et « Meta » la vraie touche Ctrl.
-TERM_CTRL = Qt.KeyboardModifier.MetaModifier if IS_MAC else Qt.KeyboardModifier.ControlModifier
-APP_MOD = Qt.KeyboardModifier.ControlModifier          # Cmd sur Mac
-
-
-def key_mods(ev, option_as_meta=False):
-    m = ev.modifiers()
-    shift = bool(m & Qt.KeyboardModifier.ShiftModifier)
-    ctrl = bool(m & TERM_CTRL)
-    alt = bool(m & Qt.KeyboardModifier.AltModifier)
-    cmd = IS_MAC and bool(m & Qt.KeyboardModifier.ControlModifier)
-    meta = alt and (not IS_MAC or option_as_meta)       # Option sur Mac = caractères spéciaux (| { } [ ] ~)
-    return shift, ctrl, alt, cmd, meta
-
-
-def encode_key(ev, screen, option_as_meta=False):
-    key, text = ev.key(), ev.text()
-    shift, ctrl, alt, cmd, meta = key_mods(ev, option_as_meta)
-    if cmd:
-        return None
-    mod = 1 + (1 if shift else 0) + (2 if meta else 0) + (4 if ctrl else 0)
-    if key in _CURSOR_KEYS:
-        c = _CURSOR_KEYS[key]
-        if mod > 1:
-            return f"\x1b[1;{mod}{c}"
-        return ("\x1bO" if screen.app_cursor else "\x1b[") + c
-    if key in _TILDE_KEYS:
-        n = _TILDE_KEYS[key]
-        return f"\x1b[{n};{mod}~" if mod > 1 else f"\x1b[{n}~"
-    if key in _SS3_KEYS:
-        c = _SS3_KEYS[key]
-        return f"\x1b[1;{mod}{c}" if mod > 1 else "\x1bO" + c
-    if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-        return "\x1b\r" if meta else "\r"
-    if key == Qt.Key.Key_Backspace:
-        return ("\x1b" if meta else "") + ("\x08" if ctrl else "\x7f")
-    if key == Qt.Key.Key_Backtab or (key == Qt.Key.Key_Tab and shift):
-        return "\x1b[Z"
-    if key == Qt.Key.Key_Tab:
-        return "\t"
-    if key == Qt.Key.Key_Escape:
-        return "\x1b"
-    if ctrl:
-        if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
-            return ("\x1b" if meta else "") + chr(key - Qt.Key.Key_A + 1)
-        if key in _CTRL_SPECIAL:
-            return _CTRL_SPECIAL[key]
-        if text and len(text) == 1 and ord(text) < 32:
-            return text
-    if text:
-        if text == "\x7f":
-            return "\x7f"
-        if meta and not ctrl:
-            return "\x1b" + text
-        return text
-    return None
-
-
-class TerminalView(QWidget):
-    PAD = 6
-    focused_view = Signal(object)
-    context_menu = Signal(object, QPoint)
-    close_requested = Signal(object)
-
-    def __init__(self, session, app):
-        super().__init__()
-        self.session = session
-        self.app = app
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self.setCursor(Qt.CursorShape.IBeamCursor)
-        self.setMouseTracking(True)
-        self.setMinimumSize(120, 60)
-        self.sb = QScrollBar(Qt.Orientation.Vertical, self)
-        self.sb.setObjectName("termscroll")
-        self.sb.valueChanged.connect(self._on_scroll)
-        self.follow = True
-        self.top_abs = 0
-        self.sel_anchor = self.sel_head = None
-        self._sel_mode = "char"
-        self._press_pos = None
-        self._last_click = (0.0, 0)
-        self._mouse_btn = None
-        self._wheel_acc = 0.0
-        self._blink_on = True
-        self.blink = QTimer(self)
-        self.blink.setInterval(530)
-        self.blink.timeout.connect(self._toggle_blink)
-        self._resize_timer = QTimer(self)
-        self._resize_timer.setSingleShot(True)
-        self._resize_timer.setInterval(30)
-        self._resize_timer.timeout.connect(self._apply_size)
-        self.toast = QLabel(self)
-        self.toast.setObjectName("toast")
-        self.toast.setWordWrap(False)
-        self.toast.hide()
-        self._toast_timer = QTimer(self)
-        self._toast_timer.setSingleShot(True)
-        self._toast_timer.timeout.connect(self.toast.hide)
-        self._style_cache = {}
-        self.highlight = False
-        self.apply_appearance()
-        session.output.connect(self._on_output)
-        session.notify.connect(self.show_notice)
-        session.exited.connect(self._on_exit)
-
-    # ---- apparence
-    def apply_appearance(self):
-        st = self.app.config.settings
-        self.scheme = SCHEMES.get(st.get("colorScheme"), SCHEMES["Campbell"])
-        self.palette_ = build_palette(self.scheme)
-        self.bg = QColor(self.scheme["background"])
-        self.fg = QColor(self.scheme["foreground"])
-        self.cursor_color = QColor(self.scheme["cursor"])
-        self.sel_color = blend(self.scheme["background"], self.scheme["selection"], 0.32)
-        base = mono_font(st.get("fontFamily", ""), st.get("fontSize", 13))
-        self.fonts = {}
-        for key, (bold, italic) in {"n": (False, False), "b": (True, False), "i": (False, True),
-                                    "bi": (True, True)}.items():
-            f = QFont(base)
-            f.setBold(bold)
-            f.setItalic(italic)
-            self.fonts[key] = f
-        fm = QFontMetricsF(base)
-        self.cw = max(1.0, fm.horizontalAdvance("M"))
-        self.ch = max(1, int(fm.lineSpacing() + 0.999))
-        self.ascent = fm.ascent()
-        self._style_cache = {}
-        self.update()
-        self._resize_timer.start()
-
-    def _color(self, c, bold=False):
-        if c & TRUECOLOR:
-            return QColor((c >> 16) & 255, (c >> 8) & 255, c & 255)
-        if bold and c < 8:
-            c += 8
-        return self.palette_[c & 255]
-
-    def _style(self, attr):
-        st = self._style_cache.get(attr)
-        if st is not None:
-            return st
-        fgc, bgc, fl = attr
-        fg = QColor(self.fg) if fgc == DEFAULT else self._color(fgc, bool(fl & BOLD))
-        bg = None if bgc == DEFAULT else self._color(bgc)
-        if fl & REVERSE:
-            fg, bg = (bg or QColor(self.bg)), fg
-        if fl & DIM:
-            fg = blend(fg, bg or self.bg, 0.45)
-        if fl & HIDDEN:
-            fg = bg or QColor(self.bg)
-        bold, italic = bool(fl & BOLD), bool(fl & ITALIC)
-        font = self.fonts["bi" if bold and italic else "b" if bold else "i" if italic else "n"]
-        st = (fg, bg, font, bool(fl & UNDERLINE), bool(fl & STRIKE))
-        self._style_cache[attr] = st
-        return st
-
-    # ---- géométrie
-    def grid_size(self):
-        w = self.width() - self.sb.width() - 2 * self.PAD
-        h = self.height() - 2 * self.PAD
-        return max(10, int(w // self.cw)), max(2, int(h // self.ch))
-
-    def resizeEvent(self, ev):
-        sw = 10
-        self.sb.setGeometry(self.width() - sw, 0, sw, self.height())
-        self._place_toast()
-        self._resize_timer.start()
-        super().resizeEvent(ev)
-
-    def _apply_size(self):
-        if self.width() < 40:
-            return
-        cols, rows = self.grid_size()
-        if not self.session.started:
-            self.session.start(cols, rows)
-        else:
-            self.session.resize(cols, rows)
-        self._sync_scroll()
-        self.update()
-
-    # ---- défilement
-    def _bounds(self):
-        s = self.session.screen
-        if s.alt_active:
-            return s.history_total, s.history_total
-        return s.first_abs(), s.history_total
-
-    def _sync_scroll(self):
-        lo, hi = self._bounds()
-        if self.follow:
-            self.top_abs = hi
-        self.top_abs = max(lo, min(hi, self.top_abs))
-        self.sb.blockSignals(True)
-        self.sb.setRange(lo, hi)
-        self.sb.setPageStep(self.session.screen.rows)
-        self.sb.setValue(self.top_abs)
-        self.sb.blockSignals(False)
-        self.sb.setVisible(hi > lo)
-
-    def _on_scroll(self, value):
-        lo, hi = self._bounds()
-        self.top_abs = value
-        self.follow = value >= hi
-        self.update()
-
-    def scroll_lines(self, n):
-        lo, hi = self._bounds()
-        self.top_abs = max(lo, min(hi, self.top_abs + n))
-        self.follow = self.top_abs >= hi
-        self._sync_scroll()
-        self.update()
-
-    def scroll_to_bottom(self):
-        self.follow = True
-        self._sync_scroll()
-        self.update()
-
-    def _on_output(self):
-        s = self.session.screen
-        if s.history_resets != getattr(self, "_resets", 0):
-            self._resets = s.history_resets
-            self.sel_anchor = self.sel_head = None
-        self._sync_scroll()
-        self._blink_on = True
-        self.update()
-
-    # ---- dessin
-    def paintEvent(self, ev):
-        s = self.session.screen
-        p = QPainter(self)
-        p.fillRect(self.rect(), self.bg)
-        cw, ch, pad = self.cw, self.ch, self.PAD
-        rows = s.rows
-        sel = self._selection_range()
-        for vr in range(rows):
-            abs_row = self.top_abs + vr
-            line = s.line_at(abs_row)
-            if line is None:
-                continue
-            y = pad + vr * ch
-            chars, attrs = line.chars, line.attrs
-            n = min(len(chars), s.cols)
-            # fonds
-            i = 0
-            while i < n:
-                a = attrs[i]
-                j = i + 1
-                while j < n and attrs[j] is a:
-                    j += 1
-                bg = self._style(a)[1]
-                if bg is not None:
-                    p.fillRect(QRectF(pad + i * cw, y, (j - i) * cw + 0.5, ch), bg)
-                i = j
-            if sel:
-                c0, c1 = self._sel_cols(sel, abs_row, n)
-                if c1 > c0:
-                    p.fillRect(QRectF(pad + c0 * cw, y, (c1 - c0) * cw, ch), self.sel_color)
-            # texte
-            base = y + self.ascent + (ch - QFontMetricsF(self.fonts["n"]).lineSpacing()) / 2
-            i = 0
-            while i < n:
-                a = attrs[i]
-                fg, _bg, font, underline, strike = self._style(a)
-                j = i
-                run = []
-                while j < n and attrs[j] is a and (chars[j].isascii() and len(chars[j]) == 1):
-                    run.append(chars[j])
-                    j += 1
-                if run:
-                    txt = "".join(run)
-                    if txt.strip():
-                        p.setFont(font)
-                        p.setPen(fg)
-                        p.drawText(QPointF(pad + i * cw, base), txt)
-                    if underline or strike:
-                        self._decorate(p, fg, pad + i * cw, y, (j - i) * cw, underline, strike)
-                    i = j
-                    continue
-                c = chars[i]
-                if c:
-                    p.setFont(font)
-                    p.setPen(fg)
-                    p.drawText(QPointF(pad + i * cw, base), c)
-                    if underline or strike:
-                        self._decorate(p, fg, pad + i * cw, y, cw * (2 if i + 1 < n and chars[i + 1] == "" else 1),
-                                       underline, strike)
-                i += 1
-        self._paint_cursor(p, s)
-        if self.highlight:
-            p.setPen(QPen(QColor("#4CC2FF"), 1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(self.rect().adjusted(0, 0, -1, -1))
-        p.end()
-
-    def _decorate(self, p, color, x, y, w, underline, strike):
-        p.setPen(QPen(color, 1))
-        if underline:
-            p.drawLine(QPointF(x, y + self.ch - 2), QPointF(x + w, y + self.ch - 2))
-        if strike:
-            p.drawLine(QPointF(x, y + self.ch / 2), QPointF(x + w, y + self.ch / 2))
-
-    def _paint_cursor(self, p, s):
-        if not s.cursor_visible or not self.session.running:
-            return
-        vr = s.history_total + s.cy - self.top_abs
-        if not (0 <= vr < s.rows):
-            return
-        focused = self.hasFocus()
-        if focused and self.app.config.settings.get("cursorBlink", True) and not self._blink_on:
-            return
-        x = self.PAD + s.cx * self.cw
-        y = self.PAD + vr * self.ch
-        line = s.lines[s.cy]
-        wide = s.cx + 1 < s.cols and line.chars[s.cx + 1] == ""
-        w = self.cw * (2 if wide else 1)
-        shape = self.app.config.settings.get("cursorShape", "bar")
-        if s.cursor_style in (1, 2):
-            shape = "block"
-        elif s.cursor_style in (3, 4):
-            shape = "underscore"
-        elif s.cursor_style in (5, 6):
-            shape = "bar"
-        color = self.cursor_color if focused else blend(self.cursor_color, self.bg, 0.45)
-        if not focused:
-            p.setPen(QPen(color, 1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(QRectF(x + 0.5, y + 0.5, w - 1, self.ch - 1))
-        elif shape == "block":
-            p.fillRect(QRectF(x, y, w, self.ch), color)
-            ch = line.chars[s.cx]
-            if ch.strip():
-                p.setFont(self._style(line.attrs[s.cx])[2])
-                p.setPen(self.bg)
-                p.drawText(QPointF(x, y + self.ascent), ch)
-        elif shape == "underscore":
-            p.fillRect(QRectF(x, y + self.ch - 2, w, 2), color)
-        else:
-            p.fillRect(QRectF(x, y, 2, self.ch), color)
-
-    def _toggle_blink(self):
-        self._blink_on = not self._blink_on
-        s = self.session.screen
-        vr = s.history_total + s.cy - self.top_abs
-        self.update(QRect(0, int(self.PAD + vr * self.ch) - 1, self.width(), self.ch + 2))
-
-    # ---- focus
-    def focusInEvent(self, ev):
-        self._blink_on = True
-        self.blink.start()
-        if self.session.screen.focus_events:
-            self.session.write("\x1b[I")
-        self.focused_view.emit(self)
-        if self.toast.isVisible() and self.toast.property("kind") == "focus":
-            self.toast.hide()
-        self.update()
-        super().focusInEvent(ev)
-
-    def focusOutEvent(self, ev):
-        self.blink.stop()
-        if self.session.screen.focus_events:
-            self.session.write("\x1b[O")
-        self.update()
-        super().focusOutEvent(ev)
-
-    # ---- clavier
-    @staticmethod
-    def is_terminal_key(ev):
-        """Vrai si la touche doit aller au programme (et non déclencher un raccourci de la fenêtre)."""
-        m = ev.modifiers()
-        if IS_MAC:
-            if m & Qt.KeyboardModifier.MetaModifier and ev.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
-                return False                            # Ctrl+Tab = onglet suivant
-            return not (m & APP_MOD)                    # Cmd+… = raccourcis de l'application
-        ctrl, shift = bool(m & APP_MOD), bool(m & Qt.KeyboardModifier.ShiftModifier)
-        alt = bool(m & Qt.KeyboardModifier.AltModifier)
-        if ctrl and shift and not alt:
-            return False                                # Ctrl+Maj+… = raccourcis (façon Windows Terminal)
-        if ctrl and not alt and ev.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab, Qt.Key.Key_Plus, Qt.Key.Key_Minus,
-                                            Qt.Key.Key_Equal, Qt.Key.Key_0, Qt.Key.Key_Comma):
-            return False
-        if alt and not ctrl and ev.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down,
-                                             Qt.Key.Key_Plus, Qt.Key.Key_Minus, Qt.Key.Key_Underscore,
-                                             Qt.Key.Key_Equal, Qt.Key.Key_D):
-            return False
-        return True
-
-    def event(self, ev):
-        if ev.type() == QEvent.Type.ShortcutOverride and self.is_terminal_key(ev):
-            ev.accept()
-            return True
-        return super().event(ev)
-
-    def focusNextPrevChild(self, _next):
-        return False                                    # Tab appartient au shell
-
-    def keyPressEvent(self, ev):
-        s = self.session
-        shift, ctrl, alt, cmd, meta = key_mods(ev, self.app.config.settings.get("optionAsMeta", False))
-        if not IS_MAC and ctrl and not shift and ev.key() == Qt.Key.Key_C and self.has_selection():
-            self.copy()
-            return
-        if not IS_MAC and ctrl and not shift and ev.key() == Qt.Key.Key_V:
-            self.paste()
-            return
-        if shift and not ctrl and ev.key() in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
-            self.scroll_lines((-1 if ev.key() == Qt.Key.Key_PageUp else 1) * max(1, s.screen.rows - 1))
-            return
-        if not s.running:
-            if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and s.started:
-                s.restart()
-                self.update()
-            elif ctrl and ev.key() == Qt.Key.Key_D:
-                self.close_requested.emit(self)
-            return
-        data = encode_key(ev, s.screen, self.app.config.settings.get("optionAsMeta", False))
-        if data:
-            self.clear_selection()
-            if self.toast.isVisible() and self.toast.property("kind") in ("code", "focus", "error", "warn"):
-                self.toast.hide()
-            s.user_typed()
-            s.write(data)
-            self.scroll_to_bottom()
-            self._blink_on = True
-        else:
-            super().keyPressEvent(ev)
-
-    def inputMethodEvent(self, ev):
-        txt = ev.commitString()
-        if txt and self.session.running:
-            self.clear_selection()
-            self.session.user_typed()
-            self.session.write(txt)
-            self.scroll_to_bottom()
-        ev.accept()
-
-    def inputMethodQuery(self, query):
-        if query == Qt.InputMethodQuery.ImEnabled:
-            return True
-        if query == Qt.InputMethodQuery.ImCursorRectangle:
-            s = self.session.screen
-            vr = s.history_total + s.cy - self.top_abs
-            return QRect(int(self.PAD + s.cx * self.cw), int(self.PAD + vr * self.ch), int(self.cw), self.ch)
-        return super().inputMethodQuery(query)
-
-    # ---- souris
-    def cell_at(self, pos):
-        col = int((pos.x() - self.PAD) // self.cw)
-        vr = int((pos.y() - self.PAD) // self.ch)
-        s = self.session.screen
-        col = max(0, min(s.cols - 1, col))
-        vr = max(0, min(s.rows - 1, vr))
-        return self.top_abs + vr, col, vr
-
-    def _mouse_report(self, ev, kind):
-        """Transmet la souris aux programmes qui la demandent (vim, htop…). Maj = sélection locale."""
-        s = self.session.screen
-        if not s.mouse_mode or not self.session.running or ev.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            return False
-        if s.alt_active is False and not self.follow:
-            return False
-        _abs, col, vr = self.cell_at(ev.position().toPoint())
-        if kind == "move":
-            if s.mouse_mode == 1003 or (s.mouse_mode == 1002 and self._mouse_btn is not None):
-                code = (self._mouse_btn if self._mouse_btn is not None else 3) + 32
-            else:
-                return True
-        else:
-            btn = {Qt.MouseButton.LeftButton: 0, Qt.MouseButton.MiddleButton: 1,
-                   Qt.MouseButton.RightButton: 2}.get(ev.button(), 0)
-            if kind == "press":
-                self._mouse_btn = btn
-                code = btn
-            else:
-                self._mouse_btn = None
-                code = btn if s.mouse_sgr else 3
-        m = ev.modifiers()
-        code += (4 if m & Qt.KeyboardModifier.ShiftModifier else 0) + (16 if m & TERM_CTRL else 0)
-        self._send_mouse(code, col, vr, kind == "release")
-        return True
-
-    def _send_mouse(self, code, col, row, release=False):
-        s = self.session.screen
-        if s.mouse_sgr:
-            self.session.write(f"\x1b[<{code};{col + 1};{row + 1}{'m' if release else 'M'}")
-        elif col < 223 and row < 223:
-            self.session.write("\x1b[M" + chr(32 + code) + chr(33 + col) + chr(33 + row))
-
-    def mousePressEvent(self, ev):
-        self.setFocus()
-        if ev.button() == Qt.MouseButton.RightButton:
-            self.context_menu.emit(self, ev.globalPosition().toPoint())
-            return
-        if self._mouse_report(ev, "press"):
-            return
-        if ev.button() != Qt.MouseButton.LeftButton:
-            return
-        abs_row, col, _vr = self.cell_at(ev.position().toPoint())
-        now = time.monotonic()
-        clicks = self._last_click[1] + 1 if now - self._last_click[0] < 0.4 else 1
-        self._last_click = (now, clicks)
-        if ev.modifiers() & Qt.KeyboardModifier.ShiftModifier and self.sel_anchor is not None:
-            self.sel_head = (abs_row, col)
-        elif clicks == 2:
-            self._select_word(abs_row, col)
-        elif clicks >= 3:
-            self._select_line(abs_row)
-        else:
-            self._sel_mode = "char"
-            self.sel_anchor = self.sel_head = (abs_row, col)
-            self._press_pos = ev.position().toPoint()
-        self.update()
-
-    def mouseDoubleClickEvent(self, ev):
-        self.mousePressEvent(ev)
-
-    def mouseMoveEvent(self, ev):
-        if self._mouse_report(ev, "move"):
-            return
-        if not (ev.buttons() & Qt.MouseButton.LeftButton) or self.sel_anchor is None:
-            return
-        pos = ev.position().toPoint()
-        if pos.y() < 0:
-            self.scroll_lines(-1)
-        elif pos.y() > self.height():
-            self.scroll_lines(1)
-        abs_row, col, _vr = self.cell_at(pos)
-        x_col = (pos.x() - self.PAD) / self.cw
-        if self._sel_mode == "char" and x_col - int(x_col) > 0.5:
-            col = min(self.session.screen.cols, col + 1)
-        self.sel_head = (abs_row, col)
-        self.update()
-
-    def mouseReleaseEvent(self, ev):
-        if self._mouse_report(ev, "release"):
-            return
-        if self.sel_anchor == self.sel_head and self._sel_mode == "char":
-            self.sel_anchor = self.sel_head = None
-            self.update()
-        elif self.has_selection() and self.app.config.settings.get("copyOnSelect"):
-            self.copy(clear=False)
-
-    def wheelEvent(self, ev):
-        s = self.session.screen
-        if ev.modifiers() & APP_MOD:
-            self.app.zoom(1 if ev.angleDelta().y() > 0 else -1)
-            return
-        dy = ev.pixelDelta().y() / self.ch if not ev.pixelDelta().isNull() else ev.angleDelta().y() / 40
-        self._wheel_acc += dy
-        steps = int(self._wheel_acc)
-        if not steps:
-            return
-        self._wheel_acc -= steps
-        if s.mouse_mode and self.session.running:
-            _abs, col, vr = self.cell_at(ev.position().toPoint())
-            for _ in range(min(abs(steps), 10)):
-                self._send_mouse(64 if steps > 0 else 65, col, vr)
-            return
-        if s.alt_active and self.session.running:
-            key = ("\x1bOA" if s.app_cursor else "\x1b[A") if steps > 0 else ("\x1bOB" if s.app_cursor else "\x1b[B")
-            self.session.write(key * min(abs(steps), 10))
-            return
-        self.scroll_lines(-steps)
-
-    # ---- sélection
-    def _selection_range(self):
-        if self.sel_anchor is None or self.sel_head is None or self.sel_anchor == self.sel_head:
-            return None
-        a, b = sorted([self.sel_anchor, self.sel_head])
-        return a, b
-
-    @staticmethod
-    def _sel_cols(sel, abs_row, n):
-        (r0, c0), (r1, c1) = sel
-        if abs_row < r0 or abs_row > r1:
-            return 0, 0
-        start = c0 if abs_row == r0 else 0
-        end = c1 if abs_row == r1 else n
-        return start, min(end, n)
-
-    def has_selection(self):
-        return self._selection_range() is not None
-
-    def clear_selection(self):
-        if self.sel_anchor is not None:
-            self.sel_anchor = self.sel_head = None
-            self.update()
-
-    def _select_word(self, abs_row, col):
-        line = self.session.screen.line_at(abs_row)
-        if line is None:
-            return
-        chars = line.chars
-        word = re.compile(r"[\w.\-/~:@%+=#,]")
-        if not word.match(chars[col] or " "):
-            self.sel_anchor, self.sel_head = (abs_row, col), (abs_row, col + 1)
-            return
-        a = col
-        while a > 0 and word.match(chars[a - 1] or " "):
-            a -= 1
-        b = col
-        while b < len(chars) and word.match(chars[b] or " "):
-            b += 1
-        self.sel_anchor, self.sel_head = (abs_row, a), (abs_row, b)
-        self._sel_mode = "word"
-
-    def _select_line(self, abs_row):
-        self.sel_anchor, self.sel_head = (abs_row, 0), (abs_row, self.session.screen.cols)
-        self._sel_mode = "line"
-
-    def select_all(self):
-        s = self.session.screen
-        self.sel_anchor, self.sel_head = (s.first_abs(), 0), (s.history_total + s.rows - 1, s.cols)
-        self.update()
-
-    def selected_text(self):
-        sel = self._selection_range()
-        if not sel:
-            return ""
-        s = self.session.screen
-        (r0, _c0), (r1, _c1) = sel
-        out = []
-        for r in range(r0, r1 + 1):
-            line = s.line_at(r)
-            if line is None:
-                continue
-            a, b = self._sel_cols(sel, r, len(line.chars))
-            txt = "".join(line.chars[a:b])
-            if r < r1 and line.wrapped and b >= len(line.chars):
-                out.append(txt)
-            else:
-                out.append(txt.rstrip() + ("\n" if r < r1 else ""))
-        return "".join(out)
-
-    def copy(self, clear=True):
-        txt = self.selected_text()
-        if txt:
-            QGuiApplication.clipboard().setText(txt)
-            if clear:
-                self.clear_selection()
-        return bool(txt)
-
-    def paste(self):
-        txt = QGuiApplication.clipboard().text()
-        if not txt or not self.session.running:
-            return
-        if "\n" in txt.rstrip("\n") and self.app.config.settings.get("warnPaste", True):
-            n = txt.rstrip("\n").count("\n") + 1
-            if not confirm(self.window(), "Coller plusieurs lignes",
-                           f"Tu vas coller {n} lignes : chacune sera exécutée comme une commande.\n\n"
-                           + txt[:400] + ("…" if len(txt) > 400 else ""), ok="Coller"):
-                return
-        self.session.user_typed()
-        self.session.paste(txt)
-        self.scroll_to_bottom()
-
-    def clear_buffer(self):
-        s = self.session.screen
-        s.history.clear()
-        s.history_resets += 1
-        self.sel_anchor = self.sel_head = None
-        self.scroll_to_bottom()
-
-    # ---- recherche dans l'historique
-    def find(self, text, backwards=True, case=False):
-        """Cherche à partir de la sélection actuelle ; sélectionne et montre le résultat."""
-        if not text:
-            return False
-        s = self.session.screen
-        needle = text if case else text.lower()
-        first, last = s.first_abs(), s.history_total + s.rows - 1
-        if self.sel_anchor is not None:
-            start = min(self.sel_anchor, self.sel_head)[0] - (1 if backwards else -1)
-        else:
-            start = last if backwards else first
-        rng = range(start, first - 1, -1) if backwards else range(start, last + 1)
-        for r in rng:
-            line = s.line_at(r)
-            if line is None:
-                continue
-            hay = "".join(c if c else "" for c in line.chars)
-            hay = hay if case else hay.lower()
-            k = hay.rfind(needle) if backwards else hay.find(needle)
-            if k >= 0:
-                self.sel_anchor, self.sel_head = (r, k), (r, k + len(text))
-                lo, hi = self._bounds()
-                if not (self.top_abs <= r < self.top_abs + s.rows):
-                    self.top_abs = max(lo, min(hi, r - s.rows // 2))
-                    self.follow = self.top_abs >= hi
-                    self._sync_scroll()
-                self.update()
-                return True
-        return False
-
-    # ---- notifications dans le volet
-    def show_notice(self, kind, message):
-        self.toast.setText({"code": "🔑  ", "reason": "✓  ", "error": "⚠  ", "warn": "⚠  "}.get(kind, "") + message)
-        self.toast.setProperty("kind", kind)
-        self.toast.setStyleSheet({"error": "QLabel#toast { border-color: #E74856; }",
-                                  "warn": "QLabel#toast { border-color: #FCE100; }"}.get(kind, ""))
-        self.toast.adjustSize()
-        self._place_toast()
-        self.toast.show()
-        self.toast.raise_()
-        if kind in ("code", "error", "warn"):
-            self._toast_timer.stop()          # reste affiché jusqu'à ce que tu tapes
-            win = self.window()
-            if not win.isActiveWindow():
-                QApplication.alert(win, 0)    # le Dock rebondit
-            if self.isVisible():
-                self.setFocus()
-        else:
-            self._toast_timer.start(5000)
-        self.app.on_notice(self, kind)
-
-    def _place_toast(self):
-        if not self.toast.isVisible() and not self.toast.text():
-            return
-        self.toast.adjustSize()
-        w, h = self.toast.width(), self.toast.height()
-        self.toast.move(max(8, (self.width() - self.sb.width() - w) // 2), self.height() - h - 14)
-
-    def _on_exit(self, code):
-        self.update()
-
-    def show_exit_message(self, code):
-        self.session.screen.feed(
-            f"\r\n\x1b[90m[session terminée, code {code}] Entrée pour se reconnecter, "
-            f"{'Cmd+W' if IS_MAC else 'Ctrl+W'} pour fermer l'onglet.\x1b[0m")
-        self._on_output()
 
 
 # ======================================================================================
@@ -4577,7 +2448,6 @@ QToolButton:hover { background: rgba(0, 0, 0, 0.055); }
 QToolButton:pressed { background: rgba(0, 0, 0, 0.09); }
 QToolButton:checked { background: rgba(0, 0, 0, 0.07); }
 QToolButton:disabled { color: @disabled; }
-QToolButton#lockOn { background: #FFF4CE; border: 1px solid #F2C94C; color: #6B4E00; }
 QFrame#addressBar { background: @body; border: 1px solid @border; border-radius: 4px; }
 QFrame#addressBar QToolButton { padding: 2px 5px; border-radius: 3px; border: none; }
 QFrame#addressBar QLabel#crumbSep { color: @text2; padding: 0 1px; }
@@ -4601,7 +2471,12 @@ QTreeWidget#list::item, QTreeWidget#topo::item { height: 28px; border: none; pad
 QTreeWidget#list::item:hover, QTreeWidget#topo::item:hover { background: @hover; }
 QTreeWidget#list::item:selected, QTreeWidget#topo::item:selected { background: @select; color: @text; }
 QTreeWidget#list::item:selected:hover, QTreeWidget#topo::item:selected:hover { background: @selhover; }
-QTreeWidget#nav { background: @body; border-right: 1px solid @line; }
+QTreeWidget#nav { background: @body; border: none; }
+QWidget#navPane { background: @body; border-right: 1px solid @line; }
+QLineEdit#navSearch {
+    background: @chrome; border: 1px solid @border; border-radius: 4px; padding: 0 6px; min-height: 26px;
+}
+QLineEdit#navSearch:focus { background: @body; border-bottom: 2px solid @accent; }
 QTreeWidget#nav::item { height: 28px; border-radius: 4px; padding-left: 2px; }
 QTreeWidget#nav::item:hover { background: @navhover; }
 QTreeWidget#nav::item:selected { background: @navsel; color: @text; }
@@ -4651,7 +2526,6 @@ QStatusBar::item { border: none; }
 QStatusBar QLabel { color: @text2; padding: 0 6px; }
 QLabel#badgeDemo { background: #C239B3; color: white; border-radius: 3px; padding: 1px 8px; font-weight: 600; }
 QLabel#badgeRO { background: #E6ECF4; color: #34495E; border-radius: 3px; padding: 1px 8px; }
-QLabel#badgeRW { background: #FCE100; color: #3B3000; border-radius: 3px; padding: 1px 8px; font-weight: 600; }
 QMenu { background: @menu; border: 1px solid #D9D9D9; border-radius: 8px; padding: 4px; }
 QMenu::item { padding: 6px 32px 6px 10px; border-radius: 4px; margin: 1px 0; color: @text; }
 QMenu::item:selected { background: rgba(0, 0, 0, 0.055); color: @text; }
@@ -4669,11 +2543,6 @@ QScrollBar::handle:horizontal { background: #C2C2C2; min-width: 32px; border-rad
 QScrollBar::handle:hover { background: #8C8C8C; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-QScrollBar#termscroll:vertical { background: transparent; width: 10px; margin: 0; }
-QScrollBar#termscroll::handle:vertical { background: #5A5A5A; border-radius: 3px; min-height: 30px; margin: 2px 3px; }
-QScrollBar#termscroll::handle:vertical:hover { background: #8A8A8A; margin: 1px 2px; }
-QLabel#toast { background: rgba(32,32,32,235); color: #FFFFFF; border: 1px solid #4CC2FF; border-radius: 8px;
-    padding: 8px 14px; font-weight: bold; }
 QToolTip { background: @menu; color: @text; border: 1px solid #D9D9D9; padding: 4px 6px; border-radius: 4px; }
 QDialog, QMessageBox, QInputDialog { background: @menu; }
 QGroupBox { border: 1px solid @border; border-radius: 6px; margin-top: 14px; padding: 10px 8px 8px 8px; }
@@ -4851,6 +2720,35 @@ def _(p, c):
     p.drawPolygon(QPolygonF(pts))
 
 
+@_icon("external")
+def _(p, c):
+    _pen(p, c, 1.2)
+    _poly(p, (7.0, 3.0), (3.0, 3.0), (3.0, 13.0), (13.0, 13.0), (13.0, 9.0))
+    _line(p, 7.5, 8.5, 13.5, 2.5); _poly(p, (9.5, 2.5), (13.5, 2.5), (13.5, 6.5))
+
+
+def _star(p, c, filled):
+    pts = []
+    for i in range(10):
+        a = -math.pi / 2 + i * math.pi / 5
+        r = 6.4 if i % 2 == 0 else 2.7
+        pts.append(QPointF(8 + r * math.cos(a), 8.4 + r * math.sin(a)))
+    _pen(p, c, 1.1)
+    if filled:
+        p.setBrush(QColor(c))
+    p.drawPolygon(QPolygonF(pts))
+
+
+@_icon("star")
+def _(p, c):
+    _star(p, c, False)
+
+
+@_icon("starfill")
+def _(p, c):
+    _star(p, "#E8A200" if c == C["text"] else c, True)
+
+
 @_icon("pane")
 def _(p, c):
     _pen(p, c, 1.2); p.drawRoundedRect(QRectF(1.6, 2.4, 12.8, 11.2), 1.6, 1.6); _line(p, 10.4, 2.4, 10.4, 13.6)
@@ -4963,6 +2861,9 @@ SHAPES = {
     "yaml": [("r", 2.5, 1, 13.5, 15, "#8a8a8a"), ("r", 3.5, 2, 12.5, 14, _W), ("r", 5, 4.5, 8, 5.5, "#c42b1c"),
              ("r", 6.5, 7.5, 11, 8.5, "#2b88d8"), ("r", 6.5, 10.5, 10, 11.5, "#2b88d8")],
     "welcome": [("c", 8, 8, 7.4, "#2b88d8"), ("r", 7.2, 3.5, 8.8, 5, _W), ("r", 7.2, 6.5, 8.8, 12.5, _W)],
+    "fav": [("p", [(8 + (7.0 if i % 2 == 0 else 3.0) * math.cos(-math.pi / 2 + i * math.pi / 5),
+                    8.6 + (7.0 if i % 2 == 0 else 3.0) * math.sin(-math.pi / 2 + i * math.pi / 5))
+                   for i in range(10)], "#f2a600")],
     "ok": [("c", 8, 8, 4.2, "#0aac23")],
     "warn": [("c", 8, 8, 4.2, "#e8a200")],
     "err": [("c", 8, 8, 4.2, "#dc3c3d")],
@@ -4991,7 +2892,9 @@ class Icons:
                 continue
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(color))
-            if kind == "r":
+            if kind == "p":
+                p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in s[1]]))
+            elif kind == "r":
                 p.drawRect(QRectF(s[1], s[2], s[3] - s[1], s[4] - s[2]))
             elif kind == "c":
                 p.drawEllipse(QPointF(s[1], s[2]), s[3], s[3])
@@ -6186,9 +4089,10 @@ class DetailsPane(QScrollArea):
                 dot.setPixmap(Icons.get(lvl).pixmap(16, 16))
                 line.addWidget(dot)
                 line.addWidget(QLabel(cont["name"]), 1)
-                b_term = QPushButton("Terminal")
+                b_term = QPushButton("Terminal ↗")
                 b_term.setObjectName("small")
-                b_term.clicked.connect(lambda _c=False, c=cont["name"]: self.app.open_terminal(obj, c))
+                b_term.setToolTip("Ouvre le terminal du pod dans la console OpenShift (navigateur)")
+                b_term.clicked.connect(lambda _c=False: self.app.open_console(obj=obj, res=res, page="terminal"))
                 b_logs = QPushButton("Logs")
                 b_logs.setObjectName("small")
                 b_logs.clicked.connect(lambda _c=False, c=cont["name"]: self.app.open_logs(obj, c))
@@ -6273,7 +4177,7 @@ class LoginDialog(QDialog):
     nom, serveur, namespaces (connexion directe), code, points d'accès IBM (compte IBM Cloud)."""
 
     def __init__(self, parent, title, intro="", iam_url=IAM_DEFAULT, name=None, server=None, namespaces=None,
-                 code_required=True, cs_url=None, code_hint=None):
+                 code_required=True, cs_url=None, code_hint=None, console=None):
         super().__init__(parent)
         self.setWindowTitle(APP_NAME)
         self.setMinimumWidth(580)
@@ -6289,7 +4193,7 @@ class LoginDialog(QDialog):
             lay.addWidget(_hint(intro))
         form = QFormLayout()
         form.setHorizontalSpacing(14)
-        self.name = self.server = self.namespaces = self.iam = self.cs = None
+        self.name = self.server = self.namespaces = self.iam = self.cs = self.console = None
         if name is not None:
             self.name = QLineEdit(name)
             form.addRow("Nom", self.name)
@@ -6325,6 +4229,10 @@ class LoginDialog(QDialog):
             if cs_url is not None:
                 self.cs = QLineEdit(cs_url)
                 af.addRow("Point d'accès Containers", self.cs)
+            if console is not None:
+                self.console = QLineEdit(console)
+                self.console.setPlaceholderText("trouvée toute seule à la connexion (comme oc whoami --show-console)")
+                af.addRow("Console web", self.console)
             af.addRow("", _hint("Réseau privé IBM : https://private.iam.cloud.ibm.com"
                                 + (" · https://private.containers.cloud.ibm.com" if cs_url is not None else "")))
             lay.addWidget(adv)
@@ -6378,6 +4286,10 @@ class LoginDialog(QDialog):
             if not self._https("Point d'accès IAM", r["iamUrl"]):
                 return
             outside.append(r["iamUrl"])
+        if self.console is not None:
+            r["console"] = self.console.text().strip().rstrip("/")
+            if r["console"] and not self._https("Console web", r["console"]):
+                return
         if self.cs is not None:
             r["csUrl"] = self.cs.text().strip().rstrip("/") or CS_DEFAULT
             if not self._https("Point d'accès Containers", r["csUrl"]):
@@ -6462,24 +4374,6 @@ class SettingsDialog(QDialog):
         nl.addStretch(1)
         tabs.addTab(net, "Réseau")
 
-        term = QWidget()
-        tf = QFormLayout(term)
-        self.scheme = QComboBox()
-        self.scheme.addItems(list(SCHEMES))
-        self.scheme.setCurrentText(self.s.get("colorScheme", "Campbell"))
-        tf.addRow("Couleurs", self.scheme)
-        self.font_size = QSpinBox()
-        self.font_size.setRange(8, 28)
-        self.font_size.setValue(int(self.s.get("fontSize", 13)))
-        tf.addRow("Taille du texte", self.font_size)
-        self.meta = QCheckBox("La touche Option sert de touche Méta (Alt) dans le terminal")
-        self.meta.setChecked(bool(self.s.get("optionAsMeta", False)))
-        tf.addRow("", self.meta)
-        self.warn = QCheckBox("Prévenir avant de coller plusieurs lignes")
-        self.warn.setChecked(bool(self.s.get("warnPaste", True)))
-        tf.addRow("", self.warn)
-        tabs.addTab(term, "Terminal")
-
         logs = QWidget()
         lf = QFormLayout(logs)
         self.tail = QComboBox()
@@ -6518,8 +4412,6 @@ class SettingsDialog(QDialog):
             if d and "." in d and re.match(r"^[a-z0-9.-]+$", d) and d not in doms:
                 doms.append(d)
         self.s.update(useMacCerts=self.mac.isChecked(), caFile=ca, proxy=proxy, extraDomains=doms,
-                      colorScheme=self.scheme.currentText(), fontSize=self.font_size.value(),
-                      optionAsMeta=self.meta.isChecked(), warnPaste=self.warn.isChecked(),
                       logTail=int(self.tail.currentText()))
         self.accept()
 
@@ -6546,9 +4438,9 @@ class PaaSWindow(QMainWindow):
         self._busy = 0
         self._flash_token = 0
         self._syncing = False
-        self.allow_writes = False
         self.nav_items = {}
-        self.term_views = []
+        self._notice = {}        # (compte, cluster) -> message à afficher dans la prochaine fenêtre du code
+        self._auto_prompt = {}   # (compte, cluster) -> heure de la dernière demande automatique de code
         self._relays = []
         self._pending = {}       # (compte, cluster) -> rappels en attente d'une connexion en cours
         self._listing = set()    # comptes IBM dont la liste des clusters est en cours de chargement
@@ -6613,17 +4505,16 @@ class PaaSWindow(QMainWindow):
                               ["Meta+Tab", "Ctrl+Shift+]"] if mac else ["Ctrl+Tab"])
         self.act_prev_tab = A("Onglet précédent", lambda: self.cycle_tab(-1),
                               ["Meta+Shift+Tab", "Ctrl+Shift+["] if mac else ["Ctrl+Shift+Tab"])
-        self.act_zoom_in = A("Agrandir le texte du terminal", lambda: self.zoom(1), ["Ctrl++", "Ctrl+="])
-        self.act_zoom_out = A("Réduire le texte du terminal", lambda: self.zoom(-1), ["Ctrl+-"])
-        self.act_zoom_reset = A("Taille normale du terminal", lambda: self.zoom(0), ["Ctrl+0"])
-        self.act_terminal = A("Ouvrir un terminal dans le pod", self.action_terminal, ["Ctrl+T"], "terminal")
+        self.act_terminal = A("Terminal du pod (console OpenShift)", self.action_terminal, ["Ctrl+T"], "terminal")
         self.act_logs = A("Afficher les logs", self.action_logs, ["Ctrl+L"], "logs")
         self.act_yaml = A("Afficher le YAML", self.action_yaml, ["Ctrl+Y"], "yaml")
-        self.act_scale = A("Mettre à l'échelle…", self.action_scale, (), "scale")
-        self.act_restart = A("Redémarrer (rollout restart)", self.action_restart, (), "restart")
-        self.act_delete = A("Supprimer…", self.action_delete, ["Delete", "Ctrl+Backspace"], "delete")
-        self.act_allow = A("Autoriser les modifications (supprimer, mettre à l'échelle, redémarrer)",
-                           self.toggle_writes, (), "unlock", checkable=True)
+        self.act_console = A("Ouvrir dans la console OpenShift (pour modifier)", lambda: self.open_console(),
+                             ["Ctrl+Shift+O"], "external")
+        self.act_console_yaml = A("Modifier le YAML dans la console OpenShift", lambda: self.open_console(page="yaml"))
+        self.act_cluster_console = A("Ouvrir la console du cluster", lambda: self.open_console(scope="cluster"))
+        self.act_portal = A("Ouvrir le cluster dans le portail IBM Cloud", self.open_portal)
+        self.act_fav = A("Ajouter aux favoris", self.toggle_favorite, ["Ctrl+D"], "star")
+        self.act_goto = A("Rechercher un namespace ou un favori", self.focus_nav_search, ["Ctrl+P", "Ctrl+K"])
         self.act_private = A("Utiliser le point d'accès privé du cluster", self.toggle_private, (), checkable=True)
         self.act_reconnect = A("Reconnecter le cluster", self.reconnect)
         self.act_copy_cli = A("Copier la commande de connexion (CLI)", self.copy_cli, (), "copy")
@@ -6653,9 +4544,10 @@ class PaaSWindow(QMainWindow):
         menu("Édition", [self.act_copy, self.act_paste, self.act_select_all, None, self.act_find])
         menu("Affichage", [self.act_refresh, None, self.act_details, self.act_system, None, self.act_back,
                            self.act_fwd, self.act_up, None, self.act_next_tab, self.act_prev_tab, None,
-                           self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset])
-        menu("Cluster", [self.act_terminal, self.act_logs, self.act_yaml, None, self.act_scale, self.act_restart,
-                         self.act_delete, None, self.act_allow, None, self.act_private, self.act_reconnect,
+                           self.act_fav, self.act_goto])
+        menu("Cluster", [self.act_logs, self.act_yaml, None, self.act_console, self.act_console_yaml,
+                         self.act_terminal, self.act_cluster_console, self.act_portal, None,
+                         self.act_private, self.act_reconnect,
                          self.act_copy_cli])
         menu("Aide", [self.act_shortcuts, None, self.act_demo, None, self.act_lock, self.act_about])
 
@@ -6689,23 +4581,33 @@ class PaaSWindow(QMainWindow):
         sep()
         btn("refresh", "Actualiser", self.act_refresh)
         sep()
-        btn("terminal", "Terminal", self.act_terminal)
         btn("logs", "Logs", self.act_logs)
         btn("yaml", "YAML", self.act_yaml)
         sep()
-        btn("scale", "Mettre à l'échelle", self.act_scale)
-        btn("restart", "Redémarrer", self.act_restart)
-        btn("delete", "Supprimer", self.act_delete)
+        cons = btn("console", "Console", self.act_console,
+                   "Ouvre la page de l'objet (ou du namespace) dans la console OpenShift : c'est là que se font "
+                   "les modifications (mettre à l'échelle, redémarrer, supprimer, modifier)")
+        cmenu = QMenu(cons)
+        for act in (self.act_console, self.act_console_yaml, self.act_terminal, None, self.act_cluster_console,
+                    self.act_portal):
+            cmenu.addSeparator() if act is None else cmenu.addAction(act)
+        style_menu(cmenu)
+        cons.setMenu(cmenu)
+        cons.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        btn("terminal", "Terminal", self.act_terminal, "Ouvre le terminal du pod dans la console OpenShift")
+        sep()
+        fav = btn("fav", "Favori", self.act_fav, "Ajouter ou retirer l'endroit affiché des favoris (Cmd+D)")
+        fav.setCheckable(True)
         lay.addStretch(1)
-        self.lock_btn = QToolButton()
-        self.lock_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.lock_btn.clicked.connect(lambda _c=False: self.act_allow.trigger())
-        lay.addWidget(self.lock_btn)
+        ro = QLabel("Lecture seule")
+        ro.setObjectName("badgeRO")
+        ro.setToolTip("Cet outil ne modifie rien. Pour modifier : bouton « Console » (console OpenShift).")
+        lay.addWidget(ro)
+        lay.addSpacing(6)
         b = btn("details", "Détails", self.act_details)
         b.setCheckable(True)
         b.setChecked(self.act_details.isChecked())
         self.act_details.toggled.connect(b.setChecked)
-        self._update_lock()
         return bar
 
     def _build_addressbar(self):
@@ -6755,7 +4657,34 @@ class PaaSWindow(QMainWindow):
         self.nav.itemExpanded.connect(lambda it: self._expand(it.data(0, Qt.ItemDataRole.UserRole)))
         self.nav.currentItemChanged.connect(self._nav_current)
         self.nav.itemClicked.connect(self._nav_clicked)
-        self.split.addWidget(self.nav)
+        pane = QWidget()
+        pane.setObjectName("navPane")
+        pl = QVBoxLayout(pane)
+        pl.setContentsMargins(6, 6, 0, 0)
+        pl.setSpacing(4)
+        self.nav_search = QLineEdit()
+        self.nav_search.setObjectName("navSearch")
+        self.nav_search.setClearButtonEnabled(True)
+        self.nav_search.setPlaceholderText("Namespace ou favori…")
+        self.nav_search.setToolTip("Filtre l'arbre : namespaces (nsxxxx), favoris, clusters. Entrée : ouvrir le "
+                                   "premier trouvé. " + QKeySequence("Ctrl+P").toString(
+                                       QKeySequence.SequenceFormat.NativeText))
+        self.nav_search.addAction(Glyphs.get("search", C["text2"]), QLineEdit.ActionPosition.LeadingPosition)
+        self.nav_search.textChanged.connect(self._filter_nav)
+        self.nav_search.returnPressed.connect(self._nav_search_go)
+        esc = QAction(self.nav_search)
+        esc.setShortcut(QKeySequence(Qt.Key.Key_Escape))
+        esc.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        esc.triggered.connect(self.nav_search.clear)
+        self.nav_search.addAction(esc)
+        down = QAction(self.nav_search)
+        down.setShortcut(QKeySequence(Qt.Key.Key_Down))
+        down.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        down.triggered.connect(self.nav.setFocus)
+        self.nav_search.addAction(down)
+        pl.addWidget(self.nav_search)
+        pl.addWidget(self.nav, 1)
+        self.split.addWidget(pane)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("main")
@@ -6810,13 +4739,11 @@ class PaaSWindow(QMainWindow):
         self.st_demo = QLabel("MODE DÉMO")
         self.st_demo.setObjectName("badgeDemo")
         self.st_demo.hide()
-        self.st_ro = QLabel("")
         self.st_conn = QLabel("Non connecté")
         self.st_ver = QLabel(f"v{VERSION}")
         self.st_ver.setToolTip(version_details())
-        for w in (self.st_demo, self.st_ro, self.st_conn, self.st_ver):
+        for w in (self.st_demo, self.st_conn, self.st_ver):
             sb.addPermanentWidget(w)
-        self._update_lock()
 
     def _restore_geometry(self):
         geo = self.config.settings.get("windowGeometry") or ""
@@ -6855,16 +4782,6 @@ class PaaSWindow(QMainWindow):
             elif ok:
                 ok(res)
         run_async(fn, done)
-
-    def on_notice(self, view, kind):
-        pass
-
-    def zoom(self, d):
-        st = self.config.settings
-        st["fontSize"] = 13 if d == 0 else max(8, min(28, int(st.get("fontSize", 13)) + d))
-        for v in self.term_views:
-            v.apply_appearance()
-        self._save()
 
     def _save(self):
         try:
@@ -6960,6 +4877,7 @@ class PaaSWindow(QMainWindow):
 
     # ------------------------------------------------------------------ connexions et comptes
     def _load_accounts(self):
+        self._render_favorites()
         for a in self.config.accounts:
             self._register_account(a)
 
@@ -6971,6 +4889,14 @@ class PaaSWindow(QMainWindow):
         meta = self.account_meta.get(name)
         return f"C{SEP}{name}{SEP}{DirectAccount.CID}" if self._is_direct(meta) else f"A{SEP}{name}"
 
+    def _known_namespaces(self, acc, cid):
+        """Namespaces déjà connus d'une connexion (indiqués à la main + vus à la dernière connexion)."""
+        meta = self.account_meta.get(acc, {})
+        cached = self.config.data.get("nsCache", {}).get(f"{acc}{SEP}{cid}", [])
+        names = set(meta.get("namespaces", []) if self._is_direct(meta) else []) | set(cached)
+        show_sys = self.act_system.isChecked()
+        return sorted(n for n in names if show_sys or not is_system_ns(n) or n in meta.get("namespaces", []))
+
     def _register_account(self, meta, index=None):
         name = meta["name"]
         self.account_meta[name] = meta
@@ -6979,8 +4905,12 @@ class PaaSWindow(QMainWindow):
             self.clusters[(name, acc.CID)] = acc.cluster()
             iid = self._acc_iid(name)
             if iid not in self.nav_items:
+                known = self._known_namespaces(name, acc.CID)
                 self._nav_add(None, iid, name, "openshift", index=index,
-                              placeholder="Code à saisir (clic pour se connecter)")
+                              placeholder=None if known else "Code à saisir (clic pour se connecter)")
+                for ns in known:            # namespaces déjà connus : visibles (et cherchables) avant connexion
+                    self._nav_add(iid, f"N{SEP}{name}{SEP}{acc.CID}{SEP}{ns}", ns,
+                                  "folder_sys" if is_system_ns(ns) else "folder", placeholder="")
             return
         secret = SESSION_SECRETS.get(name)
         if secret:
@@ -6991,7 +4921,7 @@ class PaaSWindow(QMainWindow):
             self._nav_add(None, iid, name, "account", index=index,
                           placeholder="Chargement…" if secret else "Code à saisir (clic pour se connecter)")
 
-    def _ensure_account(self, name, ask=True):
+    def _ensure_account(self, name, ask=True, notice=""):
         """Compte IBM Cloud ouvert ; demande un code à usage unique (ou une clé API) si besoin."""
         acc = self.accounts.get(name)
         if acc is not None or not ask:
@@ -7000,7 +4930,8 @@ class PaaSWindow(QMainWindow):
         if not meta:
             return None
         r = ask_login(self, title=f"Compte IBM Cloud « {name} »",
-                      intro="Comme « ibmcloud login --sso » : un code à usage unique suffit (pas de clé API).",
+                      intro=(notice.rstrip(".") + ".\n\n" if notice else "") +
+                      "Comme « ibmcloud login --sso » : un code à usage unique suffit (pas de clé API).",
                       iam_url=meta.get("iamUrl"))
         if not r or not r.get("code"):
             return None
@@ -7023,7 +4954,7 @@ class PaaSWindow(QMainWindow):
                       intro="Comme « oc login -u passcode -p <code> --server=<serveur> », puis « oc project "
                             "<namespace> ». L'adresse du serveur figure dans la console IBM Cloud (« Master URL ») "
                             "ou dans la commande de connexion de la console OpenShift.",
-                      name="", server="", namespaces="", iam_url=IAM_DEFAULT)
+                      name="", server="", namespaces="", iam_url=IAM_DEFAULT, console="")
         if r:
             self._store_meta(r, None, r.get("code"))
 
@@ -7083,7 +5014,7 @@ class PaaSWindow(QMainWindow):
         if self._is_direct(meta):
             r = ask_login(self, title=f"Connexion « {name} »", name=name, server=meta["server"],
                           namespaces=", ".join(meta.get("namespaces", [])), iam_url=meta.get("iamUrl"),
-                          code_required=False)
+                          code_required=False, console=meta.get("console", ""))
         else:
             r = ask_login(self, title=f"Compte IBM Cloud « {name} »", name=name, iam_url=meta.get("iamUrl"),
                           cs_url=meta.get("csUrl"), code_required=False)
@@ -7165,12 +5096,14 @@ class PaaSWindow(QMainWindow):
             return f"V{SEP}{acc}{SEP}{cid}{SEP}{ns}{SEP}{v}"
         return None
 
-    @staticmethod
-    def _loc_from_iid(iid):
+    def _loc_from_iid(self, iid):
         p = str(iid).split(SEP)
         t = p[0]
         if p[-1] == "~":
             return None
+        if t == "FAV" and len(p) == 2 and p[1].isdigit():
+            favs = self.config.data.get("favorites", [])
+            return self._fav_loc(favs[int(p[1])]) if int(p[1]) < len(favs) else None
         if t == "A" and len(p) == 2:
             return {"view": "account", "acc": p[1]}
         if t == "C" and len(p) == 3:
@@ -7356,22 +5289,7 @@ class PaaSWindow(QMainWindow):
         self.act_reconnect.setEnabled(bool(loc.get("cid")))
         self.act_copy_cli.setEnabled(bool(loc.get("cid")))
 
-    def _update_lock(self):
-        if not hasattr(self, "st_ro") or not hasattr(self, "lock_btn"):
-            return
-        on = self.allow_writes
-        self.lock_btn.setText("Modifications autorisées" if on else "Lecture seule")
-        self.lock_btn.setIcon(Glyphs.get("unlock" if on else "lock", "#6B4E00" if on else None))
-        self.lock_btn.setObjectName("lockOn" if on else "")
-        self.lock_btn.setStyleSheet(self.lock_btn.styleSheet())
-        self.lock_btn.style().unpolish(self.lock_btn)
-        self.lock_btn.style().polish(self.lock_btn)
-        self.lock_btn.setToolTip("Cliquer pour revenir en lecture seule" if on else
-                                 "Supprimer, mettre à l'échelle et redémarrer sont bloqués. Cliquer pour les autoriser.")
-        self.st_ro.setText("MODIFICATIONS AUTORISÉES" if on else "Lecture seule")
-        self.st_ro.setObjectName("badgeRW" if on else "badgeRO")
-        self.st_ro.style().unpolish(self.st_ro)
-        self.st_ro.style().polish(self.st_ro)
+
 
     # ------------------------------------------------------------------ pages
     def _show(self, widget):
@@ -7432,9 +5350,13 @@ class PaaSWindow(QMainWindow):
             def err(e):
                 self._listing.discard(name)
                 if getattr(e, "status", None) in (400, 401) and name != DEMO_NAME:
-                    self.accounts.pop(name, None)            # code refusé ou session finie : on redemandera
+                    self.accounts.pop(name, None)            # code refusé ou session finie : on en redemande un
                     self._nav_set_placeholder(iid, "Code à saisir (clic pour se connecter)")
                     self.nav_items[iid].setExpanded(False)
+                    if time.time() - self._auto_prompt.get(name, 0) > 20:
+                        self._auto_prompt[name] = time.time()
+                        QTimer.singleShot(0, lambda: self._expand_account(name, notice=str(e)))
+                        return
                 else:
                     self._nav_set_placeholder(iid, "Erreur — voir la barre d'état")
                 self.flash(f"IBM Cloud : {e}", 15000)
@@ -7466,7 +5388,7 @@ class PaaSWindow(QMainWindow):
         if self.loc.get("view") == "account" and self.loc.get("acc") == acc:
             self.load_view()
 
-    def _connect(self, acc, cid, then, on_err=None, code=None):
+    def _connect(self, acc, cid, then, on_err=None, code=None, attempt=0, waiting=None):
         key = (acc, cid)
         if key in self.kubes:
             then(self.kubes[key])
@@ -7482,7 +5404,7 @@ class PaaSWindow(QMainWindow):
             return
         private = bool(self.config.cluster_pref(cid).get("private", False)) and bool(cluster.get("private"))
         ciid = f"C{SEP}{acc}{SEP}{cid}"
-        self._pending[key] = [(then, on_err)]
+        self._pending[key] = waiting or [(then, on_err)]
         needs = getattr(account, "needs_code", None)
         if not code and needs and needs(cluster, private):
             r = self._ask_cluster_code(acc, cid)
@@ -7500,9 +5422,15 @@ class PaaSWindow(QMainWindow):
         self.flash(f"Connexion à {cluster['name']}…", 30000)
         self._nav_set_placeholder(ciid, "Connexion…")
 
+        console_set = meta.get("console", "") if self._is_direct(meta) else ""
+        ingress = cluster.get("ingress", "")
+
         def work():
             kube = account.connect(cluster, private, code) if code else account.connect(cluster, private)
             names, how = kube.namespaces(declared)
+            fallback = f"https://console-openshift-console.{ingress}" if ingress and cluster["type"] == "openshift" \
+                else ""
+            kube.console = console_set or kube.find_console(fallback)
             return kube, names, how
 
         def ok(res):
@@ -7512,11 +5440,21 @@ class PaaSWindow(QMainWindow):
             who = f" en tant que {kube.user}" if getattr(kube, "user", "") else ""
             note = {"tous": "", "projets": " (tes projets)", "déclarés": " (indiqués dans la connexion)"}.get(how, "")
             self.flash(f"Connecté à {cluster['name']}{who} : {len(nss)} namespace(s){note}.", 8000)
+            self.config.data.setdefault("nsCache", {})[f"{acc}{SEP}{cid}"] = list(nss)[:3000]
+            self._save()
+            if ciid in self.nav_items:
+                self._fill_cluster(acc, cid)
             self._update_conn()
+            self._update_commands()
             for then_cb, _fail in self._pending.pop(key, []):
-                then_cb(kube)
+                if then_cb:
+                    then_cb(kube)
 
         def err(e):
+            if getattr(e, "status", None) == 401 and needs and attempt < 2 and acc != DEMO_NAME:
+                self._notice[key] = str(e)              # code refusé ou expiré : on en redemande un tout de suite
+                self._connect(acc, cid, None, attempt=attempt + 1, waiting=self._pending.pop(key, []))
+                return
             needs_now = needs and needs(cluster, private)
             self._nav_set_placeholder(ciid, "Code à saisir (clic pour se connecter)" if needs_now
                                       else "Échec de connexion")
@@ -7534,9 +5472,11 @@ class PaaSWindow(QMainWindow):
         """Fenêtre du code pour un cluster ; pour une connexion directe, serveur et namespaces y sont modifiables."""
         meta = self.account_meta.get(acc, {})
         cluster = self.clusters[(acc, cid)]
+        notice = self._notice.pop((acc, cid), "")
+        lead = (notice.rstrip(".") + ".\n\n") if notice else ""
         if self._is_direct(meta):
             r = ask_login(self, title=f"Connexion à « {acc} »",
-                          intro="Comme « oc login -u passcode -p <code> --server=<serveur> ».",
+                          intro=lead + "Comme « oc login -u passcode -p <code> --server=<serveur> ».",
                           server=meta["server"], namespaces=", ".join(meta.get("namespaces", [])),
                           iam_url=meta.get("iamUrl"))
             if r and (r["server"] != meta["server"] or r["namespaces"] != meta.get("namespaces", [])):
@@ -7550,7 +5490,8 @@ class PaaSWindow(QMainWindow):
         prefs = self.config.cluster_pref(cid)
         account = self.accounts.get(acc)
         r = ask_login(self, title=f"Cluster « {cluster['name']} »",
-                      intro="Comme « oc login -u passcode » : il faut un nouveau code (chacun ne sert qu'une fois). "
+                      intro=lead + "Comme « oc login -u passcode » : il faut un nouveau code (chacun ne sert qu'une "
+                            "fois). "
                             "Indique tes namespaces si le cluster ne te laisse pas les lister.",
                       namespaces=", ".join(prefs.get("namespaces", [])),
                       iam_url=getattr(account, "iam_url", IAM_DEFAULT))
@@ -7571,7 +5512,13 @@ class PaaSWindow(QMainWindow):
         if seq != self._load_seq:
             return
         if getattr(e, "status", None) == 401 or "HTTP 401" in str(e):
-            self._drop_session((self.loc.get("acc"), self.loc.get("cid")))
+            key = (self.loc.get("acc"), self.loc.get("cid"))
+            self._drop_session(key)
+            if time.time() - self._auto_prompt.get(key, 0) > 20:       # session expirée : nouveau code demandé
+                self._auto_prompt[key] = time.time()
+                self._notice[key] = "Ta session a expiré : saisis un nouveau code à usage unique"
+                self.load_view()
+                return
             self._show_message("Session expirée", "Le cluster n'accepte plus ta session. Reconnecte-toi avec un "
                                "nouveau code à usage unique.", "warn", [("Se reconnecter…", self.load_view)])
             return
@@ -7651,20 +5598,7 @@ class PaaSWindow(QMainWindow):
             self._shown_loc = None
             self.load_view()
 
-    def toggle_writes(self, on):
-        if on and not self.allow_writes:
-            if not confirm(self, "Autoriser les modifications",
-                           "Supprimer, mettre à l'échelle et redémarrer agiront sur les clusters réels.\n\n"
-                           "L'autorisation dure jusqu'à la fermeture du programme, ou jusqu'à ce que tu "
-                           "repasses en lecture seule.", ok="Autoriser"):
-                self.act_allow.blockSignals(True)
-                self.act_allow.setChecked(False)
-                self.act_allow.blockSignals(False)
-                return
-        self.allow_writes = bool(on)
-        self._update_lock()
-        self._update_commands()
-        self.flash("Modifications autorisées." if on else "Retour en lecture seule.")
+
 
     # ------------------------------------------------------------------ contenus
     def load_view(self):
@@ -7802,8 +5736,8 @@ class PaaSWindow(QMainWindow):
         self._register_account(meta)
         self.navigate({"view": "account", "acc": name}) if self.loc.get("acc") != name else self.load_view()
 
-    def _expand_account(self, name):
-        if self._ensure_account(name) is not None:
+    def _expand_account(self, name, notice=""):
+        if self._ensure_account(name, notice=notice) is not None:
             iid = f"A{SEP}{name}"
             if iid in self.nav_items:
                 self.nav_items[iid].setExpanded(True)
@@ -8013,7 +5947,6 @@ class PaaSWindow(QMainWindow):
         self.update_status_counts()
 
     def focus_search(self):
-        w = QApplication.focusWidget()
         tab = self.tabs.currentWidget()
         if isinstance(tab, TextTab):
             tab.search.setFocus()
@@ -8022,8 +5955,6 @@ class PaaSWindow(QMainWindow):
         if isinstance(tab, LogsTab):
             tab.filter.setFocus()
             tab.filter.selectAll()
-            return
-        if isinstance(w, TerminalView):
             return
         self.tabs.setCurrentIndex(0)
         self.search.setFocus()
@@ -8048,27 +5979,32 @@ class PaaSWindow(QMainWindow):
         objs = self._sel_objects()
         kinds = {r["res"]["kind"] for r in objs}
         one = len(objs) == 1
-        writes = self.allow_writes
+        loc = self.loc
+        in_cluster = bool(loc.get("cid"))
         states = {
             self.act_terminal: one and kinds == {"Pod"},
             self.act_logs: one and kinds == {"Pod"},
             self.act_yaml: one,
-            self.act_scale: writes and one and bool(kinds & {"Deployment", "StatefulSet", "DeploymentConfig",
-                                                             "ReplicaSet"}),
-            self.act_restart: writes and one and bool(kinds & {"Deployment", "StatefulSet", "DaemonSet"}),
-            self.act_delete: writes and bool(objs),
+            self.act_console: in_cluster,
+            self.act_console_yaml: one,
+            self.act_cluster_console: in_cluster,
+            self.act_portal: in_cluster and loc.get("acc") != DEMO_NAME,
+            self.act_fav: in_cluster,
         }
         for act, on in states.items():
             act.setEnabled(bool(on))
         for key, act in (("terminal", self.act_terminal), ("logs", self.act_logs), ("yaml", self.act_yaml),
-                         ("scale", self.act_scale), ("restart", self.act_restart), ("delete", self.act_delete)):
+                         ("console", self.act_console), ("fav", self.act_fav)):
             b = self.cmd.get(key)
             if b is not None:
                 b.setEnabled(act.isEnabled())
-                if key in ("scale", "restart", "delete") and not writes:
-                    b.setToolTip(f"{act.text()} — lecture seule : clique d'abord sur « Lecture seule »")
-                else:
-                    b.setToolTip(act.text())
+        is_fav = self._fav_index(self._fav_key(loc)) is not None
+        self.act_fav.setText("Retirer des favoris" if is_fav else "Ajouter aux favoris")
+        self.act_fav.setIcon(Glyphs.get("starfill" if is_fav else "star"))
+        b = self.cmd.get("fav")
+        if b is not None:
+            b.setChecked(is_fav)
+            b.setIcon(self.act_fav.icon())
 
     def _list_open(self):
         sel = self.listview.selected()
@@ -8118,28 +6054,33 @@ class PaaSWindow(QMainWindow):
                 obj = objs[0]["obj"]
                 conts = [c["name"] for c in obj.get("spec", {}).get("containers", [])]
                 if len(conts) > 1:
-                    sub = m.addMenu(Glyphs.get("terminal"), "Ouvrir un terminal")
-                    for c in conts:
-                        sub.addAction(c, lambda c=c: self.open_terminal(obj, c))
                     sub2 = m.addMenu(Glyphs.get("logs"), "Afficher les logs")
                     for c in conts:
                         sub2.addAction(c, lambda c=c: self.open_logs(obj, c))
                 else:
-                    m.addAction(self.act_terminal)
                     m.addAction(self.act_logs)
             if one:
                 m.addAction(self.act_yaml)
             m.addSeparator()
-            if one and kinds & {"Deployment", "StatefulSet", "DeploymentConfig", "ReplicaSet"}:
-                m.addAction(self.act_scale)
-            if one and kinds & {"Deployment", "StatefulSet", "DaemonSet"}:
-                m.addAction(self.act_restart)
+            act = m.addAction(Glyphs.get("external"), "Ouvrir dans la console OpenShift (modifier, mettre à "
+                              "l'échelle, redémarrer, supprimer)" if one else "Ouvrir la liste dans la console OpenShift",
+                              lambda: self.open_console())
+            f = act.font()
+            f.setBold(not sel or bool(objs))
+            if one:
+                m.addAction(self.act_console_yaml)
+            if one and kinds == {"Pod"}:
+                m.addAction(self.act_terminal)
+            m.addSeparator()
             m.addAction(Glyphs.get("copy"), "Copier le nom",
                         lambda: self._copy("\n".join(r["obj"]["metadata"]["name"] for r in objs)))
-            m.addSeparator()
-            m.addAction(self.act_delete)
-            if not self.allow_writes:
-                m.addAction(self.act_allow)
+            if self.loc["view"] == "cluster" and one:
+                ns = objs[0]["obj"]["metadata"]["name"]
+                loc_ns = {"view": "overview", "acc": self.loc["acc"], "cid": self.loc["cid"], "ns": ns}
+                in_fav = self._fav_index(self._fav_key(loc_ns)) is not None
+                m.addAction(Glyphs.get("starfill" if in_fav else "star"),
+                            "Retirer des favoris" if in_fav else "Ajouter aux favoris",
+                            lambda: self.toggle_favorite(loc_ns))
         if self.loc["view"] == "account" and sel and sel[0].get("cluster"):
             m.addAction(Glyphs.get("copy"), "Copier la commande de connexion (CLI)",
                         lambda c=sel[0]["cluster"]: self._copy(self._cli_for(c, self.loc.get("acc"))))
@@ -8158,9 +6099,24 @@ class PaaSWindow(QMainWindow):
             return
         iid = it.data(0, Qt.ItemDataRole.UserRole) or ""
         loc = self._loc_from_iid(iid)
+        kind = str(iid).split(SEP)[0]
         if loc:
             m.addAction("Ouvrir", lambda: self.navigate(loc))
+        if kind == "FAV":
+            i = int(str(iid).split(SEP)[1])
+            m.addAction("Renommer…", lambda: self.rename_favorite(i))
+            m.addAction(Glyphs.get("star"), "Retirer des favoris", lambda: self.remove_favorite(i))
+        elif loc and loc.get("cid") and kind in ("N", "V", "C"):
+            in_fav = self._fav_index(self._fav_key(loc)) is not None
+            m.addAction(Glyphs.get("starfill" if in_fav else "star"),
+                        "Retirer des favoris" if in_fav else "Ajouter aux favoris", lambda: self.toggle_favorite(loc))
+        if loc and loc.get("cid") and kind in ("N", "V", "C", "FAV"):
+            m.addAction(Glyphs.get("external"), "Ouvrir dans la console OpenShift",
+                        lambda: (self.navigate(loc) if self.loc != loc else None, self.open_console()))
         if str(iid).startswith("C" + SEP) and loc:
+            if loc["acc"] != DEMO_NAME:
+                cl = self.clusters.get((loc["acc"], loc["cid"]), {})
+                m.addAction("Ouvrir le cluster dans le portail IBM Cloud", lambda: self.open_url(portal_link(cl)))
             cl = self.clusters.get((loc["acc"], loc["cid"]))
             if cl:
                 m.addAction(Glyphs.get("copy"), "Copier la commande de connexion (CLI)",
@@ -8198,15 +6154,9 @@ class PaaSWindow(QMainWindow):
             self._copy(self._cli_for(cl))
 
     # ------------------------------------------------------------------ édition (copier / coller)
-    def _focused_terminal(self):
-        w = QApplication.focusWidget()
-        return w if isinstance(w, TerminalView) else None
+
 
     def edit_copy(self):
-        view = self._focused_terminal()
-        if view is not None:
-            view.copy()
-            return
         w = QApplication.focusWidget()
         if isinstance(w, (QLineEdit, QPlainTextEdit)):
             w.copy()
@@ -8216,19 +6166,11 @@ class PaaSWindow(QMainWindow):
             self._copy("\n".join(r["obj"]["metadata"]["name"] for r in objs))
 
     def edit_paste(self):
-        view = self._focused_terminal()
-        if view is not None:
-            view.paste()
-            return
         w = QApplication.focusWidget()
         if isinstance(w, QLineEdit):
             w.paste()
 
     def edit_select_all(self):
-        view = self._focused_terminal()
-        if view is not None:
-            view.select_all()
-            return
         w = QApplication.focusWidget()
         if isinstance(w, (QLineEdit, QPlainTextEdit)):
             w.selectAll()
@@ -8239,9 +6181,7 @@ class PaaSWindow(QMainWindow):
     def action_terminal(self):
         objs = self._sel_objects()
         if len(objs) == 1 and objs[0]["res"]["kind"] == "Pod":
-            obj = objs[0]["obj"]
-            conts = [c["name"] for c in obj.get("spec", {}).get("containers", [])]
-            self.open_terminal(obj, conts[0] if conts else None)
+            self.open_console(page="terminal")
 
     def action_logs(self):
         objs = self._sel_objects()
@@ -8255,64 +6195,7 @@ class PaaSWindow(QMainWindow):
             md = r["obj"]["metadata"]
             self.open_yaml(r["res"], md.get("namespace"), md["name"], r["obj"])
 
-    def _writes_ok(self):
-        if self.allow_writes:
-            return True
-        QMessageBox.information(self, APP_NAME, "Lecture seule : autorise d'abord les modifications "
-                                                "(bouton « Lecture seule » ou menu Cluster).")
-        return False
 
-    def action_scale(self):
-        objs = self._sel_objects()
-        if len(objs) != 1 or not self._writes_ok():
-            return
-        r = objs[0]
-        md = r["obj"]["metadata"]
-        cur = int(r["obj"].get("spec", {}).get("replicas", 1) or 0)
-        n, ok = QInputDialog.getInt(self, APP_NAME, f"Nombre de réplicas pour {r['res']['kind']} « {md['name']} » :",
-                                    cur, 0, 500)
-        if not ok or n == cur:
-            return
-        if n == 0 and not confirm(self, APP_NAME, f"Arrêter tous les pods de « {md['name']} » (0 réplica) ?",
-                                  ok="Arrêter"):
-            return
-        kube = self._kube()
-        self.bg(lambda: kube.scale(r["res"], md.get("namespace"), md["name"], n),
-                lambda _res: (self.flash(f"{md['name']} : {n} réplica(s) demandé(s)."),
-                              QTimer.singleShot(800, self.load_view)))
-
-    def action_restart(self):
-        objs = self._sel_objects()
-        if len(objs) != 1 or not self._writes_ok():
-            return
-        r = objs[0]
-        md = r["obj"]["metadata"]
-        if not confirm(self, APP_NAME, f"Redémarrer {r['res']['kind']} « {md['name']} » (rollout restart) ?",
-                       ok="Redémarrer"):
-            return
-        kube = self._kube()
-        self.bg(lambda: kube.restart(r["res"], md.get("namespace"), md["name"]),
-                lambda _res: self.flash(f"Redémarrage de {md['name']} demandé."))
-
-    def action_delete(self):
-        objs = self._sel_objects()
-        if not objs or not self._writes_ok():
-            return
-        names = "\n".join(f"  • {r['res']['kind']} {r['obj']['metadata']['name']}" for r in objs[:15])
-        more = f"\n  … et {len(objs) - 15} autre(s)" if len(objs) > 15 else ""
-        cl = self.clusters.get((self.loc.get("acc"), self.loc.get("cid")), {})
-        if not confirm_danger(self, APP_NAME,
-                              f"Supprimer définitivement {len(objs)} objet(s) du cluster {cl.get('name', '')} ?\n\n"
-                              f"{names}{more}\n\nCette suppression ne peut pas être annulée."):
-            return
-        kube = self._kube()
-
-        def work():
-            for r in objs:
-                md = r["obj"]["metadata"]
-                kube.delete(r["res"], md.get("namespace"), md["name"])
-            return len(objs)
-        self.bg(work, lambda n: (self.flash(f"{n} objet(s) supprimé(s)."), QTimer.singleShot(600, self.load_view)))
 
     # ------------------------------------------------------------------ onglets
     def _add_tab(self, widget, title, icon):
@@ -8326,10 +6209,6 @@ class PaaSWindow(QMainWindow):
         if index <= 0 or index >= self.tabs.count():
             return
         w = self.tabs.widget(index)
-        if isinstance(w, TerminalView):
-            w.session.close()
-            if w in self.term_views:
-                self.term_views.remove(w)
         if hasattr(w, "close_tab"):
             w.close_tab()
         self.tabs.removeTab(index)
@@ -8353,39 +6232,6 @@ class PaaSWindow(QMainWindow):
                     lambda: [self.close_tab(j) for j in reversed(range(1, self.tabs.count())) if j != i])
         popup(m, bar.mapToGlobal(pos))
 
-    def open_terminal(self, pod_obj, container=None):
-        kube = self._kube()
-        if kube is None:
-            return
-        md = pod_obj["metadata"]
-        phase = pod_obj.get("status", {}).get("phase", "")
-        if phase and phase != "Running":
-            QMessageBox.information(self, APP_NAME, f"Le pod « {md['name']} » n'est pas démarré ({phase}) : "
-                                                    "impossible d'y ouvrir un terminal.")
-            return
-        ns, pod = md["namespace"], md["name"]
-        title = f"{pod[:28]}{' · ' + container if container else ''}"
-        session = PodSession(lambda: kube.exec_backend(ns, pod, container), title)
-        view = TerminalView(session, self)
-        session.exited.connect(lambda code, v=view: v.show_exit_message(code))
-        view.context_menu.connect(self._terminal_menu)
-        view.close_requested.connect(lambda v: self.close_tab(self.tabs.indexOf(v)))
-        self.term_views.append(view)
-        self._add_tab(view, title, "terminal")
-        QTimer.singleShot(60, view.setFocus)
-
-    def _terminal_menu(self, view, gpos):
-        m = QMenu(self)
-        a = m.addAction(Glyphs.get("copy"), "Copier", view.copy)
-        a.setEnabled(view.has_selection())
-        m.addAction("Coller", view.paste)
-        m.addAction("Tout sélectionner", view.select_all)
-        m.addAction("Effacer l'historique", view.clear_buffer)
-        m.addSeparator()
-        m.addAction(Glyphs.get("refresh"), "Reconnecter", lambda: (view.session.close(), view.session.restart()))
-        m.addAction("Fermer l'onglet", lambda: self.close_tab(self.tabs.indexOf(view)))
-        popup(m, gpos)
-
     def open_logs(self, pod_obj, container=None):
         kube = self._kube()
         if kube is None:
@@ -8407,6 +6253,225 @@ class PaaSWindow(QMainWindow):
     def open_helm_tab(self, release):
         self._add_tab(HelmTab(self, release), f"Helm · {release.get('name')}", "helm")
 
+    # ------------------------------------------------------------------ console OpenShift et portail IBM Cloud
+    def _console_base(self, acc=None, cid=None):
+        acc, cid = acc or self.loc.get("acc"), cid or self.loc.get("cid")
+        kube = self.kubes.get((acc, cid))
+        if kube is not None and getattr(kube, "console", ""):
+            return kube.console
+        meta = self.account_meta.get(acc, {})
+        if self._is_direct(meta) and meta.get("console"):
+            return meta["console"]
+        cl = self.clusters.get((acc, cid), {})
+        if cl.get("ingress") and cl.get("type") == "openshift":
+            return f"https://console-openshift-console.{cl['ingress']}"
+        server = cl.get("public") or cl.get("private") or ""
+        return server.rstrip("/") + "/console" if server else ""
+
+    def open_url(self, url):
+        """Ouvre une page dans le navigateur : https seulement, chez IBM Cloud ou sur la console du cluster."""
+        u = urlsplit(url or "")
+        host = (u.hostname or "").lower()
+        consoles = {urlsplit(self._console_base(a, c)).hostname for (a, c) in self.clusters}
+        ok = u.scheme == "https" and host and (NET.permitted(host) or host.endswith(".appdomain.cloud")
+                                               or host in consoles)
+        if not ok:
+            QMessageBox.warning(self, APP_NAME, f"Adresse refusée : {url}")
+            return False
+        if not QDesktopServices.openUrl(QUrl(url)):
+            copy_text(url)
+            QMessageBox.information(self, APP_NAME, f"Adresse copiée : colle-la dans ton navigateur.\n\n{url}")
+        else:
+            self.flash(f"Ouvert dans le navigateur : {url}", 8000)
+        return True
+
+    def open_console(self, obj=None, res=None, page="", scope=""):
+        """Page de la console OpenShift qui correspond à ce qui est affiché ou sélectionné (là où l'on modifie)."""
+        loc = self.loc
+        base = self._console_base()
+        if not base:
+            QMessageBox.information(self, APP_NAME, "Adresse de la console inconnue : connecte-toi d'abord au "
+                                                    "cluster, ou indique-la dans la connexion (Modifier…).")
+            return
+        if scope == "cluster":
+            return self.open_url(base)
+        if obj is None and self.tabs.currentIndex() == 0 and self.stack.currentWidget() is self.listview:
+            sel = self.listview.selected()
+            if len(sel) == 1 and sel[0].get("helm"):
+                r = sel[0]["helm"]
+                return self.open_url(console_link(base, "helm", r.get("namespace") or loc.get("ns"), name=r.get("name")))
+            objs = self._sel_objects()
+            if len(objs) == 1:
+                obj, res = objs[0]["obj"], objs[0]["res"]
+        if obj is not None and res is not None:
+            md = obj.get("metadata", {})
+            ns = md.get("namespace") or loc.get("ns")
+            if res.get("key") == "namespaces":
+                return self.open_url(console_link(base, ns=md.get("name")))
+            return self.open_url(console_link(base, res=res, ns=ns, name=md.get("name"), page=page))
+        v = loc.get("view")
+        if v == "list":
+            return self.open_url(console_link(base, res=loc["res"], ns=loc.get("ns")))
+        if v in ("topology", "helm"):
+            return self.open_url(console_link(base, v, loc.get("ns")))
+        return self.open_url(console_link(base, ns=loc.get("ns")))
+
+    def open_portal(self):
+        cl = self.clusters.get((self.loc.get("acc"), self.loc.get("cid")))
+        if cl is not None:
+            self.open_url(portal_link(cl))
+
+    # ------------------------------------------------------------------ favoris
+    @staticmethod
+    def _fav_key(loc):
+        if not loc or not loc.get("cid") or loc.get("view") not in ("cluster", "overview", "list", "topology",
+                                                                     "helm", "all"):
+            return None
+        return (loc.get("acc"), loc.get("cid"), loc.get("ns") or "", loc.get("view"),
+                (loc.get("res") or {}).get("key", "") if loc.get("view") == "list" else "")
+
+    def _fav_index(self, key):
+        if key is None:
+            return None
+        for i, f in enumerate(self.config.data.get("favorites", [])):
+            if (f.get("acc"), f.get("cid"), f.get("ns", ""), f.get("view"), f.get("res", "")) == key:
+                return i
+        return None
+
+    @staticmethod
+    def _fav_loc(f):
+        loc = {"view": f.get("view", "overview"), "acc": f.get("acc"), "cid": f.get("cid")}
+        if f.get("ns"):
+            loc["ns"] = f["ns"]
+        if loc["view"] == "list":
+            res = CATALOG_BY_KEY.get(f.get("res", ""))
+            if res is None:
+                return None
+            loc["res"] = res
+        return loc
+
+    def _fav_default_label(self, loc):
+        if loc.get("ns"):
+            extra = {"list": (loc.get("res") or {}).get("label", ""), "topology": "Topologie", "helm": "Charts Helm",
+                     "all": "Tous les objets"}.get(loc["view"], "")
+            return loc["ns"] + (f" · {extra}" if extra else "")
+        return self.clusters.get((loc.get("acc"), loc.get("cid")), {}).get("name") or loc.get("acc", "")
+
+    def toggle_favorite(self, loc=None):
+        loc = loc or self.loc
+        key = self._fav_key(loc)
+        if key is None:
+            return
+        favs = self.config.data.setdefault("favorites", [])
+        i = self._fav_index(key)
+        if i is not None:
+            removed = favs.pop(i)
+            self.flash(f"Retiré des favoris : {removed.get('label')}")
+        else:
+            label = self._fav_default_label(loc)
+            favs.append({"acc": key[0], "cid": key[1], "ns": key[2], "view": key[3], "res": key[4], "label": label})
+            self.flash(f"Ajouté aux favoris : {label} (clic droit sur le favori › Renommer pour lui donner un nom "
+                       "parlant)", 8000)
+        self._save()
+        self._render_favorites()
+        self._update_commands()
+
+    def rename_favorite(self, i):
+        favs = self.config.data.get("favorites", [])
+        if not 0 <= i < len(favs):
+            return
+        text, ok = QInputDialog.getText(self, "Renommer le favori",
+                                        f"Nom affiché pour {favs[i].get('ns') or favs[i].get('acc')} :",
+                                        QLineEdit.EchoMode.Normal, favs[i].get("label", ""))
+        if ok and text.strip():
+            favs[i]["label"] = text.strip()[:80]
+            self._save()
+            self._render_favorites()
+
+    def remove_favorite(self, i):
+        favs = self.config.data.get("favorites", [])
+        if 0 <= i < len(favs):
+            favs.pop(i)
+            self._save()
+            self._render_favorites()
+            self._update_commands()
+
+    def _render_favorites(self):
+        expanded = self.nav_items["FAVS"].isExpanded() if "FAVS" in self.nav_items else True
+        self._nav_remove("FAVS")
+        favs = self.config.data.get("favorites", [])
+        root = self._nav_add(None, "FAVS", "Favoris", "fav", index=0)
+        root.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        root.setFont(0, ui_font(13, True))
+        if not favs:
+            hint = self._nav_add("FAVS", f"FAVS{SEP}aide", "Clic droit sur un namespace › Ajouter aux favoris")
+            hint.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            hint.setForeground(0, QBrush(QColor(C["text2"])))
+        for i, f in enumerate(favs):
+            label = f.get("label") or f.get("ns") or f.get("acc")
+            text = label if not f.get("ns") or f["ns"] in label else f"{label}  ({f['ns']})"
+            icon = {"topology": "topology", "helm": "helm", "all": "all", "cluster": "openshift"}.get(
+                f.get("view"), "folder")
+            if f.get("view") == "list":
+                icon = (CATALOG_BY_KEY.get(f.get("res", "")) or {}).get("icon", "doc")
+            it = self._nav_add("FAVS", f"FAV{SEP}{i}", text, icon)
+            cl = self.clusters.get((f.get("acc"), f.get("cid")), {})
+            it.setToolTip(0, " › ".join(x for x in (f.get("acc"), cl.get("name") if cl.get("name") != f.get("acc")
+                                                    else "", f.get("ns")) if x))
+        root.setExpanded(expanded)
+        if self.nav_search.text() if hasattr(self, "nav_search") else "":
+            self._filter_nav(self.nav_search.text())
+
+    # ------------------------------------------------------------------ recherche dans l'arbre
+    def focus_nav_search(self):
+        self.nav_search.setFocus()
+        self.nav_search.selectAll()
+
+    def _filter_nav(self, text):
+        """Filtre l'arbre : namespaces, favoris, clusters et comptes dont le nom contient le texte."""
+        q = (text or "").strip().lower()
+
+        def kind(it):
+            return str(it.data(0, Qt.ItemDataRole.UserRole) or "").split(SEP)[0]
+
+        def walk(it):
+            k = kind(it)
+            own = bool(q) and k in ("N", "FAV", "C", "A") and (q in it.text(0).lower() or q in (it.toolTip(0) or
+                                                                                              "").lower())
+            any_child = False
+            for i in range(it.childCount()):
+                any_child = walk(it.child(i)) or any_child
+            visible = not q or own or any_child
+            it.setHidden(not visible)
+            if q and any_child:
+                it.setExpanded(True)
+            return visible and bool(q)
+
+        self._syncing = True
+        try:
+            for i in range(self.nav.topLevelItemCount()):
+                walk(self.nav.topLevelItem(i))
+        finally:
+            self._syncing = False
+
+    def _nav_search_go(self):
+        """Entrée dans la recherche : ouvre le premier favori ou namespace trouvé."""
+        found = []
+
+        def walk(it):
+            if not it.isHidden():
+                if str(it.data(0, Qt.ItemDataRole.UserRole) or "").split(SEP)[0] in ("FAV", "N"):
+                    found.append(it)
+                for i in range(it.childCount()):
+                    walk(it.child(i))
+        for i in range(self.nav.topLevelItemCount()):
+            walk(self.nav.topLevelItem(i))
+        if found and self.nav_search.text().strip():
+            loc = self._loc_from_iid(found[0].data(0, Qt.ItemDataRole.UserRole))
+            if loc:
+                self.navigate(loc)
+                self.nav.setFocus()
+
     # ------------------------------------------------------------------ paramètres, aide
     def open_settings(self):
         d = SettingsDialog(self, self.config.settings)
@@ -8415,20 +6480,18 @@ class PaaSWindow(QMainWindow):
         self.config.settings.update(d.s)
         self._save()
         NET.configure(self.config.settings)
-        for v in self.term_views:
-            v.apply_appearance()
         self.flash("Paramètres enregistrés.")
 
     def show_shortcuts(self):
         k = (lambda s: QKeySequence(s).toString(QKeySequence.SequenceFormat.NativeText))
-        lines = [(k("F5"), "Actualiser"), (k("Ctrl+T"), "Terminal dans le pod"), (k("Ctrl+L"), "Logs du pod"),
-                 (k("Ctrl+Y"), "YAML de l'objet"), (k("Ctrl+Backspace"), "Supprimer (si autorisé)"),
-                 (k("Ctrl+F"), "Rechercher"), (f"{k('Ctrl+[')} / {k('Ctrl+]')}", "Précédent / Suivant"),
+        lines = [(k("F5"), "Actualiser"), (k("Ctrl+L"), "Logs du pod"), (k("Ctrl+Y"), "YAML de l'objet"),
+                 (k("Ctrl+Shift+O"), "Ouvrir dans la console OpenShift (pour modifier)"),
+                 (k("Ctrl+T"), "Terminal du pod (console OpenShift)"),
+                 (k("Ctrl+D"), "Ajouter / retirer des favoris"), (k("Ctrl+P"), "Rechercher un namespace ou un favori"),
+                 (k("Ctrl+F"), "Rechercher dans la liste"), (f"{k('Ctrl+[')} / {k('Ctrl+]')}", "Précédent / Suivant"),
                  (f"{k('Ctrl+Up')} ou {k('Backspace')}", "Dossier parent"), (k("Ctrl+W"), "Fermer l'onglet"),
                  (k("Meta+Tab") if IS_MAC else k("Ctrl+Tab"), "Onglet suivant"),
-                 (k("Ctrl+Alt+P"), "Volet des détails"),
-                 (f"{k('Ctrl+C')} / {k('Ctrl+V')}", "Copier / coller (dans le terminal aussi)"),
-                 (f"{k('Ctrl++')} / {k('Ctrl+-')}", "Taille du texte du terminal")]
+                 (k("Ctrl+Alt+P"), "Volet des détails")]
         QMessageBox.information(self, "Raccourcis clavier", "\n".join(f"{a}\t{b}" for a, b in lines))
 
     def show_lock(self):
@@ -8453,6 +6516,7 @@ class PaaSWindow(QMainWindow):
                           "Explorateur de clusters IBM Cloud Kubernetes Service et Red Hat OpenShift on IBM Cloud, "
                           "d'après le PaaSExplorer d'origine.<br><br>"
                           f"{version_details()}<br>"
+                          "Lecture seule : les modifications se font dans la console OpenShift.<br>"
                           "Codes à usage unique, jetons et clés : en mémoire seulement, jamais "
                           "enregistrés.<br>"
                           f"Réglages : {short_path(self.config.path)}<br>"

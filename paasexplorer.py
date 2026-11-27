@@ -12,7 +12,9 @@ façon Explorateur de fichiers Windows 11, pour le Mac du travail.
   - il ne se connecte qu'aux adresses d'IBM Cloud (*.cloud.ibm.com), aux points d'accès que tu
     déclares, et aux domaines que tu ajoutes toi-même dans les paramètres ;
   - certificats toujours vérifiés (ceux du Mac, plus le certificat de l'entreprise si besoin) ;
-  - la clé API reste en mémoire jusqu'à la fermeture : elle n'est jamais enregistrée.
+  - codes à usage unique, jetons et clés restent en mémoire : rien n'est jamais enregistré.
+* Connexion comme « oc login -u passcode » : adresse du serveur + namespace(s) + code à usage unique pris sur
+  https://iam.cloud.ibm.com/identity/passcode (pas besoin de clé API, ni du droit de lister les clusters).
 * Lecture seule au démarrage : supprimer, mettre à l'échelle et redémarrer demandent d'abord
   d'autoriser les modifications (menu Cluster).
 
@@ -47,8 +49,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 APP_NAME = "PaaS Explorer"
 ORG_NAME = "explorateur-maison"
-VERSION = "2.0"          # à augmenter à chaque modification (1.0.0 = version d'origine en Tkinter)
-VERSION_DATE = "26/11/2026"
+VERSION = "2.1"          # à augmenter à chaque modification (1.0.0 = version d'origine en Tkinter)
+VERSION_DATE = "27/11/2026"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -63,8 +65,8 @@ def version_details():
     return f"{APP_NAME} {VERSION} du {VERSION_DATE} — Python {sys.version.split()[0]}, PySide6 {qt}"
 
 
-EMPREINTE = "50260b7499c424c7"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
-REPERES = "8041:ab9c8f99,8ed40bd0,1163b75d,fb55a57a,e988d7ac,3d770521,5082c301,a92a87da,fa59fb45,1010b60d,d9fe4816,2666988c,1071aecf,fc249410,c41dc35c,17fbc99b,8579e83d,1e5ee178,9a850c93,c3138b05,cbd1cdf2,197d422e,bc054c6f,d1620e81,dca0aaf5,02e57f95,707dca1a,c2562c69,f024f77c,207cf593,7e8a4ece,24a8cff6,e89f8d97"            # remplis à la livraison : nombre de lignes et empreinte de chaque tranche de 250 lignes
+EMPREINTE = "2f62225d53c6d425"          # remplie à la livraison : sert à voir si le fichier a été abîmé en le copiant
+REPERES = "8527:84cb5125,fffd0a45,dbeb1104,3b1cae54,c1fb0c4c,174ecde3,ce70526c,1cb94afe,9f84ad4f,59f50945,c55c368a,c3cbf834,66a80d58,7217cf54,110512b9,27ce01ac,e4afb254,02b1fe7b,0278fdce,913dbc1b,a3bf1305,488d3ee7,308c02ae,a89167b0,a864dba6,a91ed473,fb00de09,4ea1924c,763b4323,4ef1d1be,b21b48a3,6a2d115e,49fb6ff7,7e172fe6,a2695784"            # remplis à la livraison : nombre de lignes et empreinte de chaque tranche de 250 lignes
 
 
 def _texte_compare(path):
@@ -363,14 +365,26 @@ class Config:
         return self.data["clusterPrefs"].setdefault(cid, {})
 
 
+NS_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+
+
 def clean_account(a):
-    """Ce qu'on garde d'un compte sur disque : jamais de clé, jamais d'option qui coupe les certificats."""
-    return {"name": str(a.get("name", "")).strip(), "mode": "token" if a.get("mode") == "token" else "apikey",
-            "iamUrl": str(a.get("iamUrl") or IAM_DEFAULT).strip().rstrip("/"),
+    """Ce qu'on garde d'une connexion sur disque : jamais de code, de clé ni de jeton, jamais d'option qui coupe
+    les certificats. Deux sortes : « cluster » (serveur + namespaces) et « ibm » (compte IBM Cloud)."""
+    name = str(a.get("name", "")).strip()
+    iam = str(a.get("iamUrl") or IAM_DEFAULT).strip().rstrip("/")
+    if a.get("kind") == "cluster" or a.get("server"):
+        nss = a.get("namespaces") or []
+        if isinstance(nss, str):
+            nss = re.split(r"[\s,;]+", nss)
+        nss = [n.strip().lower() for n in nss if n and NS_RE.match(n.strip().lower())]
+        return {"name": name, "kind": "cluster", "server": str(a.get("server", "")).strip().rstrip("/"),
+                "namespaces": list(dict.fromkeys(nss)), "iamUrl": iam}
+    return {"name": name, "kind": "ibm", "iamUrl": iam,
             "csUrl": str(a.get("csUrl") or CS_DEFAULT).strip().rstrip("/")}
 
 
-SESSION_SECRETS = {}     # nom du compte -> clé API / jeton : en mémoire seulement, jamais sur disque
+SESSION_SECRETS = {}     # nom du compte -> clé API : en mémoire seulement, jamais sur disque
 
 
 # ======================================================================================
@@ -631,14 +645,110 @@ def jwt_exp(token):
 # IBM Cloud (IAM + API Containers)
 # ======================================================================================
 
-class IbmAccount:
-    """Un compte IBM Cloud, authentifié par clé API (recommandé) ou par jeton IAM brut."""
-    demo = False
+IAM_CLI_BASIC = base64.b64encode(b"bx:bx").decode()      # client de la CLI IBM Cloud (ibmcloud login --sso)
+IAM_KUBE_BASIC = base64.b64encode(b"kube:kube").decode()
+PASSCODE_GRANT = "urn:ibm:params:oauth:grant-type:passcode"
+APIKEY_GRANT = "urn:ibm:params:oauth:grant-type:apikey"
 
-    def __init__(self, name, apikey=None, token=None, iam_url=IAM_DEFAULT, cs_url=CS_DEFAULT):
+
+def passcode_url(iam_url=None):
+    """Page IBM où l'on obtient un code à usage unique (la même que « ibmcloud login --sso »)."""
+    return f"{(iam_url or IAM_DEFAULT).rstrip('/')}/identity/passcode"
+
+
+def is_api_key(code):
+    """Une clé API IBM fait 44 caractères ; un code à usage unique, une dizaine."""
+    return len((code or "").strip()) >= 30 and not code.strip().startswith("sha256~")
+
+
+def _http(method, url, headers, data=None, timeout=30, ctx=None, ok_redirect=False):
+    try:
+        status, hdrs, body = NET.request(method, url, headers, data, ctx=ctx, timeout=timeout)
+    except NetError as exc:
+        raise CloudError(str(exc)) from None
+    if status >= 400 or (status >= 300 and not ok_redirect):
+        raise CloudError(f"HTTP {status} sur {urlsplit(url).hostname} : {_short(body)}", status,
+                         body.decode("utf-8", "replace"))
+    return status, hdrs, body
+
+
+def iam_token(iam_url, form, basic=None):
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+    if basic:
+        headers["Authorization"] = "Basic " + basic
+    try:
+        _, _, body = _http("POST", f"{iam_url.rstrip('/')}/identity/token", headers, form)
+    except CloudError as exc:
+        if form.get("grant_type") == PASSCODE_GRANT and exc.status in (400, 401):
+            raise CloudError("Code à usage unique refusé par IBM Cloud : il est faux, déjà utilisé ou expiré. "
+                             "Prends-en un nouveau.", exc.status) from None
+        raise
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise CloudError(f"réponse IAM illisible : {_short(body)}") from None
+
+
+def openshift_login(server, ca_pem, user, password):
+    """Comme « oc login -u <user> -p <password> --server=<server> » (user = passcode ou apikey) :
+    renvoie (jeton OAuth OpenShift, expiration)."""
+    ctx = NET.context(ca_pem)
+    _, _, body = _http("GET", f"{server.rstrip('/')}/.well-known/oauth-authorization-server",
+                       {"Accept": "application/json"}, ctx=ctx)
+    try:
+        auth_ep = json.loads(body)["authorization_endpoint"]
+    except (ValueError, KeyError, TypeError):
+        raise CloudError("Serveur de connexion OpenShift introuvable sur ce cluster.") from None
+    u = urlsplit(auth_ep)
+    if u.scheme != "https" or not NET.permitted(u.hostname or ""):
+        raise CloudError(NET.refusal(u.hostname or auth_ep))
+    url = auth_ep + "?" + urlencode({"client_id": "openshift-challenging-client", "response_type": "token"})
+    basic = base64.b64encode(f"{user}:{password}".encode()).decode()
+    try:
+        status, headers, _ = _http("GET", url, {"Authorization": "Basic " + basic, "X-CSRF-Token": "a"},
+                                   ctx=ctx, ok_redirect=True)
+    except CloudError as exc:
+        if exc.status == 401:
+            what = "Code à usage unique refusé" if user == "passcode" else "Clé API refusée"
+            raise CloudError(f"{what} par OpenShift : faux, déjà utilisé ou expiré. Prends-en un nouveau.",
+                             401) from None
+        raise
+    frag = parse_qs(urlsplit(headers.get("location", "")).fragment)
+    if "access_token" not in frag:
+        raise CloudError(f"Connexion OpenShift refusée (HTTP {status}). Vérifie tes droits sur le cluster.")
+    try:
+        life = int(frag.get("expires_in", ["86400"])[0])
+    except ValueError:
+        life = 86400
+    return frag["access_token"][0], time.time() + life
+
+
+def openshift_token_from(server, ca_pem, code):
+    """Code à usage unique, jeton OpenShift collé (sha256~…) ou clé API → (jeton, expiration)."""
+    code = (code or "").strip()
+    if code.startswith("sha256~"):
+        return code, time.time() + 86400
+    return openshift_login(server, ca_pem, "apikey" if is_api_key(code) else "passcode", code)
+
+
+def _check_server(server):
+    u = urlsplit(server or "")
+    if u.scheme != "https" or not u.hostname:
+        raise CloudError(f"Adresse de serveur invalide (https obligatoire) : {server}")
+    if not NET.permitted(u.hostname):
+        raise CloudError(NET.refusal(u.hostname))
+
+
+class IbmAccount:
+    """Un compte IBM Cloud, ouvert par code à usage unique (comme « ibmcloud login --sso ») ou par clé API."""
+    demo = False
+    kind = "ibm"
+
+    def __init__(self, name, apikey=None, passcode=None, iam_url=IAM_DEFAULT, cs_url=CS_DEFAULT):
         self.name = name
-        self.apikey = apikey
-        self.raw_token = (token or "").replace("Bearer ", "").strip() or None
+        self.apikey = apikey or None
+        self._passcode = passcode or None
+        self._refresh = None
         self.iam_url = (iam_url or IAM_DEFAULT).rstrip("/")
         self.cs_url = (cs_url or CS_DEFAULT).rstrip("/")
         NET.declare(self.iam_url)
@@ -648,63 +758,60 @@ class IbmAccount:
         self._oc_tokens = {}
         self._ca_cache = {}
         self._lock = threading.Lock()
-
-    def _http(self, method, url, headers, data=None, timeout=30, ctx=None, ok_redirect=False):
-        try:
-            status, hdrs, body = NET.request(method, url, headers, data, ctx=ctx, timeout=timeout)
-        except NetError as exc:
-            raise CloudError(str(exc)) from None
-        if status >= 400 or (status >= 300 and not ok_redirect):
-            raise CloudError(f"HTTP {status} sur {urlsplit(url).hostname} : {_short(body)}", status,
-                             body.decode("utf-8", "replace"))
-        return status, hdrs, body
+        self._auth_lock = threading.Lock()
 
     # ---- IAM
     def access_token(self, force=False):
-        if self.raw_token:
-            return self.raw_token
+        with self._auth_lock:                   # un seul échange à la fois : les autres attendent son jeton
+            return self._access_token(force)
+
+    def _access_token(self, force):
         with self._lock:
             tok, exp = self._access
             if tok and not force and time.time() < exp - 120:
                 return tok
-        js = self._iam({"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": self.apikey})
+            code, self._passcode = self._passcode, None        # un code ne sert qu'une fois
+            refresh = self._refresh
+        if self.apikey:
+            js = iam_token(self.iam_url, {"grant_type": APIKEY_GRANT, "apikey": self.apikey})
+        elif refresh:
+            try:
+                js = iam_token(self.iam_url, {"grant_type": "refresh_token", "refresh_token": refresh},
+                               basic=IAM_CLI_BASIC)
+            except CloudError:
+                raise CloudError("Session IBM Cloud expirée : clic droit sur le compte › Se reconnecter, "
+                                 "avec un nouveau code.", 401) from None
+        elif code:
+            js = iam_token(self.iam_url, {"grant_type": PASSCODE_GRANT, "passcode": code}, basic=IAM_CLI_BASIC)
+        else:
+            raise CloudError("Session IBM Cloud fermée : un nouveau code à usage unique est nécessaire.", 401)
         tok = js["access_token"]
         with self._lock:
             self._access = (tok, float(js.get("expiration") or time.time() + 3000))
+            self._refresh = js.get("refresh_token") or self._refresh
         return tok
 
     def kube_id_token(self, force=False):
-        """Jeton OIDC accepté par l'API Kubernetes des clusters IKS."""
-        if self.raw_token:
-            return self.raw_token
+        """Jeton OIDC accepté par l'API Kubernetes des clusters IKS (avec une clé API seulement)."""
+        if not self.apikey:
+            raise CloudError("Cluster Kubernetes (IKS) : la connexion par code à usage unique n'est pas prise en "
+                             "charge ; il faut une clé API pour ce type de cluster.")
         with self._lock:
             tok, exp = self._id_token
             if tok and not force and time.time() < exp - 120:
                 return tok
-        js = self._iam({"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": self.apikey,
-                        "response_type": "cloud_iam id_token"}, basic=base64.b64encode(b"kube:kube").decode())
+        js = iam_token(self.iam_url, {"grant_type": APIKEY_GRANT, "apikey": self.apikey,
+                                      "response_type": "cloud_iam id_token"}, basic=IAM_KUBE_BASIC)
         tok = js.get("id_token") or js["access_token"]
         with self._lock:
             self._id_token = (tok, jwt_exp(tok) or time.time() + 3000)
         return tok
 
-    def _iam(self, form, basic=None):
-        if not self.apikey:
-            raise CloudError("Aucune clé API pour ce compte.")
-        headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
-        if basic:
-            headers["Authorization"] = "Basic " + basic
-        _, _, body = self._http("POST", f"{self.iam_url}/identity/token", headers, form)
-        try:
-            return json.loads(body)
-        except ValueError:
-            raise CloudError(f"réponse IAM illisible : {_short(body)}") from None
-
     # ---- clusters
     def _cs_get(self, path, params=None, raw=False):
         url = f"{self.cs_url}{path}" + ("?" + urlencode(params) if params else "")
         headers = {"Authorization": "Bearer " + self.access_token(), "Accept": "application/json"}
-        _, _, body = self._http("GET", url, headers, timeout=60)
+        _, _, body = _http("GET", url, headers, timeout=60)
         if raw:
             return body
         try:
@@ -713,7 +820,14 @@ class IbmAccount:
             raise CloudError(f"réponse illisible de l'API Containers : {_short(body)}") from None
 
     def list_clusters(self):
-        data = self._cs_get("/global/v2/getClusters") or []
+        try:
+            data = self._cs_get("/global/v2/getClusters") or []
+        except CloudError as exc:
+            if exc.status == 403:
+                raise CloudError("IBM Cloud refuse de lister les clusters de ce compte (HTTP 403 : droits "
+                                 "insuffisants). Ajoute le cluster à la main avec le bouton « Connexion » "
+                                 "(adresse du serveur + namespace).", 403) from None
+            raise
         out = []
         for c in data:
             ctype = (c.get("type") or "").lower()
@@ -754,54 +868,102 @@ class IbmAccount:
         self._ca_cache[cluster_id] = ca
         return ca
 
+    @staticmethod
+    def server_of(cluster, private=False):
+        return (cluster["private"] if private and cluster.get("private") else cluster["public"]) or cluster["private"]
+
+    def needs_code(self, cluster, private=False):
+        """OpenShift ouvert par code : chaque connexion au cluster demande un nouveau code (comme oc login)."""
+        if cluster["type"] != "openshift" or self.apikey:
+            return False
+        cached = self._oc_tokens.get(self.server_of(cluster, private))
+        return not cached or time.time() > cached[1] - 60
+
+    def invalidate(self, cluster):
+        for srv in (cluster.get("public"), cluster.get("private")):
+            self._oc_tokens.pop(srv, None)
+
     # ---- client Kubernetes
-    def connect(self, cluster, private=False):
-        server = (cluster["private"] if private and cluster.get("private") else cluster["public"]) or cluster["private"]
+    def connect(self, cluster, private=False, code=None):
+        server = self.server_of(cluster, private)
         if not server:
             raise CloudError("Ce cluster n'expose aucun point d'accès (public ou privé).")
-        host = urlsplit(server).hostname or ""
-        if not NET.permitted(host):
-            raise CloudError(NET.refusal(host))
+        _check_server(server)
         ca = self.cluster_ca(cluster["id"])
+        if cluster["type"] == "openshift" and code:
+            self._oc_tokens[server] = openshift_token_from(server, ca, code)
 
         def token(force=False):
             return self.cluster_token(cluster, server, ca, force)
         token(False)   # authentification immédiate : remonte l'erreur au plus tôt
-        return KubeClient(server, token, ca, cluster["type"])
+        kube = KubeClient(server, token, ca, cluster["type"])
+        kube.whoami()
+        return kube
 
     # ---- jeton pour le cluster
     def cluster_token(self, cluster, server, ca_pem=None, force=False):
         if cluster["type"] != "openshift":
             return self.kube_id_token(force)
         cached = self._oc_tokens.get(server)
-        if cached and not force and time.time() < cached[1] - 300:
+        if cached and not (force and self.apikey) and time.time() < cached[1] - 60:
             return cached[0]
-        tok, exp = self._openshift_token(server, ca_pem)
+        if not self.apikey:
+            raise CloudError("Session OpenShift expirée : reconnecte-toi avec un nouveau code à usage unique.", 401)
+        tok, exp = openshift_login(server, ca_pem, "apikey", self.apikey)
         self._oc_tokens[server] = (tok, exp)
         return tok
 
-    def _openshift_token(self, server, ca_pem):
-        if not self.apikey:
-            return self.raw_token, time.time() + 3000
-        ctx = NET.context(ca_pem)
-        _, _, body = self._http("GET", f"{server.rstrip('/')}/.well-known/oauth-authorization-server",
-                                {"Accept": "application/json"}, ctx=ctx)
+
+class DirectAccount:
+    """Connexion directe à un cluster OpenShift : adresse du serveur + namespaces, ouverte par code à usage
+    unique (comme « oc login -u passcode -p <code> --server=<serveur> »). Aucun appel à l'API IBM Cloud."""
+    demo = False
+    kind = "cluster"
+    CID = "cluster"
+
+    def __init__(self, meta):
+        self.update(meta)
+        self._token = (None, 0.0)
+
+    def update(self, meta):
+        self.name = meta["name"]
+        self.server = meta["server"].rstrip("/")
+        self.namespaces = list(meta.get("namespaces") or [])
+        self.iam_url = meta.get("iamUrl") or IAM_DEFAULT
+        NET.declare(self.server)
+        NET.declare(self.iam_url)
+
+    def cluster(self):
+        host = urlsplit(self.server).hostname or self.server
+        return {"id": self.CID, "name": self.name, "type": "openshift", "region": "", "state": "",
+                "version": "", "provider": "", "resourceGroup": "", "workers": "", "public": self.server,
+                "private": "", "ingress": "", "host": host}
+
+    def list_clusters(self):
+        return [self.cluster()]
+
+    def needs_code(self, cluster=None, private=False):
+        tok, exp = self._token
+        return not tok or time.time() > exp - 60
+
+    def invalidate(self, cluster=None):
+        self._token = (None, 0.0)
+
+    def connect(self, cluster=None, private=False, code=None):
+        _check_server(self.server)
+        if code:
+            self._token = openshift_token_from(self.server, None, code)
+        elif self.needs_code():
+            raise CloudError("Un code à usage unique est nécessaire pour se connecter.", 401)
+        kube = KubeClient(self.server, lambda force=False: self._token[0], None, "openshift")
         try:
-            auth_ep = json.loads(body)["authorization_endpoint"]
-        except (ValueError, KeyError):
-            raise CloudError("Serveur de connexion OpenShift introuvable sur ce cluster.") from None
-        host = urlsplit(auth_ep).hostname or ""
-        if not NET.permitted(host):
-            raise CloudError(NET.refusal(host))
-        url = auth_ep + "?" + urlencode({"client_id": "openshift-challenging-client", "response_type": "token"})
-        basic = base64.b64encode(f"apikey:{self.apikey}".encode()).decode()
-        status, headers, _ = self._http("GET", url, {"Authorization": "Basic " + basic, "X-CSRF-Token": "a"},
-                                        ctx=ctx, ok_redirect=True)
-        loc = headers.get("location", "")
-        frag = parse_qs(urlsplit(loc).fragment)
-        if "access_token" not in frag:
-            raise CloudError(f"Connexion OpenShift refusée (HTTP {status}). Vérifie tes droits IAM sur le cluster.")
-        return frag["access_token"][0], time.time() + int(frag.get("expires_in", ["86400"])[0])
+            kube.whoami()
+        except KubeError as exc:
+            if exc.status == 401:
+                self.invalidate()
+                raise CloudError("Le cluster refuse ce jeton (HTTP 401) : prends un nouveau code.", 401) from None
+            raise
+        return kube
 
 
 def _ca_from_kubeconfig(text):
@@ -986,8 +1148,45 @@ class KubeClient:
         self.token_fn = token_fn          # token_fn(force: bool) -> str
         self.ca_pem = ca_pem
         self.flavor = flavor
+        self.user = ""
         self._discovery = None
         self._lock = threading.Lock()
+
+    def _token(self, force):
+        try:
+            return self.token_fn(force)
+        except CloudError as exc:
+            raise KubeError(str(exc), exc.status) from None
+
+    def whoami(self):
+        """Nom de l'utilisateur connecté (OpenShift) ; vérifie au passage que le jeton est accepté."""
+        try:
+            self.user = self.request("GET", "/apis/user.openshift.io/v1/users/~", timeout=15).get(
+                "metadata", {}).get("name", "")
+        except KubeError as exc:
+            if exc.status in (401,):
+                raise
+            self.version()
+        return self.user
+
+    def namespaces(self, declared=()):
+        """Namespaces visibles : la liste complète si on a le droit, sinon les projets OpenShift accessibles
+        (comme « oc projects »), plus ceux indiqués à la main. Renvoie (noms, origine)."""
+        names, how = [], "déclarés"
+        try:
+            names = [n["metadata"]["name"] for n in self.list(CATALOG_BY_KEY["namespaces"])]
+            how = "tous"
+        except KubeError as exc:
+            if exc.status == 401:
+                raise
+            try:
+                js = self.request("GET", "/apis/project.openshift.io/v1/projects", timeout=30)
+                names = [p["metadata"]["name"] for p in js.get("items", [])]
+                how = "projets"
+            except KubeError as exc2:
+                if exc2.status == 401:
+                    raise
+        return sorted(set(names) | {d for d in declared if d}), how
 
     @property
     def ctx(self):
@@ -1000,7 +1199,7 @@ class KubeClient:
         return url
 
     def _headers(self, force=False, ctype=None, has_body=False):
-        h = {"Authorization": "Bearer " + self.token_fn(force), "Accept": "application/json, */*"}
+        h = {"Authorization": "Bearer " + self._token(force), "Accept": "application/json, */*"}
         if has_body:
             h["Content-Type"] = ctype or "application/json"
         return h
@@ -1023,6 +1222,8 @@ class KubeClient:
                 msg = json.loads(txt).get("message") or txt
             except (ValueError, AttributeError):
                 msg = txt
+            if status == 401:
+                msg = "session expirée ou jeton refusé : reconnecte-toi avec un nouveau code"
             raise KubeError(f"HTTP {status} : {msg[:400]}", status)
         return raw
 
@@ -1148,7 +1349,7 @@ class KubeClient:
         url = self.server.replace("https://", "wss://") + f"/api/v1/namespaces/{ns}/pods/{pod}/exec?" + urlencode(params)
         last = None
         for force in (False, True):
-            ws = WSClient(url, {"Authorization": "Bearer " + self.token_fn(force)},
+            ws = WSClient(url, {"Authorization": "Bearer " + self._token(force)},
                           ["v4.channel.k8s.io", "channel.k8s.io"], self.ctx)
             try:
                 return ws.connect()
@@ -2344,6 +2545,15 @@ class DemoKube:
             k += 1
             on_line(self.log_lines(pod + str(k), 1, time.time())[0] + '\n')
 
+    user = "démo"
+
+    def whoami(self):
+        return self.user
+
+    def namespaces(self, declared=()):
+        names = [n['metadata']['name'] for n in self.list(CATALOG_BY_KEY['namespaces'])]
+        return sorted(set(names) | {d for d in declared if d}), 'tous'
+
     def exec_backend(self, ns, pod, container):
         p = self.get({'group': '', 'version': 'v1', 'name': 'pods', 'namespaced': True}, ns, pod)
         if p['status']['phase'] != 'Running':
@@ -3340,15 +3550,15 @@ def _xcolor(hexcol):
 # ======================================================================================
 
 from PySide6.QtCore import (QByteArray, QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize,  # noqa: E402
-                            Qt, QTimer, Signal)
-from PySide6.QtGui import (QAction, QBrush, QColor, QFont, QFontDatabase, QFontMetricsF,  # noqa: E402
-                           QGuiApplication, QIcon, QKeySequence, QPainter, QPainterPath, QPalette, QPen,
-                           QPixmap, QPolygonF, QSyntaxHighlighter, QTextCharFormat, QTextCursor)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox,  # noqa: E402
+                            Qt, QTimer, QUrl, Signal)
+from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QFont, QFontDatabase,  # noqa: E402
+                           QFontMetricsF, QGuiApplication, QIcon, QKeySequence, QPainter, QPainterPath, QPalette,
+                           QPen, QPixmap, QPolygonF, QSyntaxHighlighter, QTextCharFormat, QTextCursor)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa: E402
                                QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
-                               QPushButton, QRadioButton, QScrollArea, QScrollBar, QSpinBox, QSplitter,
+                               QPushButton, QScrollArea, QScrollBar, QSpinBox, QSplitter,
                                QStackedWidget, QTabBar, QTabWidget, QTextEdit, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -3430,6 +3640,17 @@ class _Relay(QObject):
     done = Signal(object, object)
 
 
+class ErrText(str):
+    """Message d'erreur passé à l'interface ; garde le code HTTP (401 = session expirée, 403 = refusé)."""
+    status = None
+
+
+def err_text(exc):
+    e = ErrText(str(exc))
+    e.status = getattr(exc, "status", None)
+    return e
+
+
 _JOBS = set()
 
 
@@ -3447,9 +3668,9 @@ def run_async(fn, callback):
         try:
             res, err = fn(), None
         except (CloudError, KubeError, NetError, WSError) as exc:
-            res, err = None, str(exc)
+            res, err = None, err_text(exc)
         except Exception as exc:  # noqa: BLE001
-            res, err = None, f"{type(exc).__name__} : {exc}"
+            res, err = None, ErrText(f"{type(exc).__name__} : {exc}")
         relay.done.emit(res, err)
     threading.Thread(target=work, daemon=True).start()
 
@@ -5996,6 +6217,7 @@ class DetailsPane(QScrollArea):
             kl = QLabel(k)
             kl.setObjectName("propKey")
             vl = QLabel(str(v))
+            vl.setTextFormat(Qt.TextFormat.PlainText)
             vl.setWordWrap(True)
             vl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             grid.addWidget(kl, i, 0, Qt.AlignmentFlag.AlignTop)
@@ -6025,92 +6247,158 @@ def short_path(path):
 
 def _hint(text):
     lab = QLabel(text)
+    lab.setTextFormat(Qt.TextFormat.PlainText)       # « <code> » doit s'afficher tel quel
     lab.setObjectName("hint")
     lab.setWordWrap(True)
     return lab
 
 
-class AccountDialog(QDialog):
-    def __init__(self, parent, account=None, has_secret=False):
+def split_namespaces(text):
+    return [n for n in re.split(r"[\s,;]+", (text or "").strip().lower()) if n]
+
+
+def open_passcode_page(parent, iam_url):
+    """Ouvre la page IBM du code à usage unique dans le navigateur (seulement cette page-là, chez IBM)."""
+    url = passcode_url(iam_url)
+    u = urlsplit(url)
+    ok = u.scheme == "https" and NET.permitted(u.hostname or "") and u.path == "/identity/passcode" \
+        and QDesktopServices.openUrl(QUrl(url))
+    if not ok:
+        copy_text(url)
+        QMessageBox.information(parent, APP_NAME, f"Adresse copiée : colle-la dans ton navigateur.\n\n{url}")
+
+
+class LoginDialog(QDialog):
+    """Connexion par code à usage unique. Les champs n'apparaissent que s'ils sont demandés :
+    nom, serveur, namespaces (connexion directe), code, points d'accès IBM (compte IBM Cloud)."""
+
+    def __init__(self, parent, title, intro="", iam_url=IAM_DEFAULT, name=None, server=None, namespaces=None,
+                 code_required=True, cs_url=None, code_hint=None):
         super().__init__(parent)
-        self.setWindowTitle("Compte IBM Cloud")
-        self.setMinimumWidth(560)
-        self.has_secret = has_secret
-        acc = account or {}
+        self.setWindowTitle(APP_NAME)
+        self.setMinimumWidth(580)
+        self.code_required = code_required
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 18, 20, 16)
-        t = QLabel("Connexion à IBM Cloud")
+        t = QLabel(title)
+        t.setTextFormat(Qt.TextFormat.PlainText)
         t.setObjectName("h2")
+        t.setWordWrap(True)
         lay.addWidget(t)
-        lay.addWidget(_hint("Les clusters IBM Cloud Kubernetes Service et Red Hat OpenShift du compte seront listés."))
+        if intro:
+            lay.addWidget(_hint(intro))
         form = QFormLayout()
         form.setHorizontalSpacing(14)
-        self.name = QLineEdit(acc.get("name", "Mon compte IBM Cloud"))
-        form.addRow("Nom du compte", self.name)
-        modes = QHBoxLayout()
-        self.r_key = QRadioButton("Clé API IBM Cloud")
-        self.r_tok = QRadioButton("Jeton IAM (Bearer)")
-        grp = QButtonGroup(self)
-        grp.addButton(self.r_key)
-        grp.addButton(self.r_tok)
-        (self.r_tok if acc.get("mode") == "token" else self.r_key).setChecked(True)
-        modes.addWidget(self.r_key)
-        modes.addWidget(self.r_tok)
-        modes.addStretch(1)
-        form.addRow("Authentification", modes)
-        self.secret = QLineEdit()
-        self.secret.setEchoMode(QLineEdit.EchoMode.Password)
-        if has_secret:
-            self.secret.setPlaceholderText("laisser vide pour garder la clé déjà saisie")
-        form.addRow("Clé / jeton", self.secret)
+        self.name = self.server = self.namespaces = self.iam = self.cs = None
+        if name is not None:
+            self.name = QLineEdit(name)
+            form.addRow("Nom", self.name)
+        if server is not None:
+            self.server = QLineEdit(server)
+            self.server.setPlaceholderText("https://c100-e.eu-de.containers.cloud.ibm.com:31234")
+            form.addRow("Serveur", self.server)
+        if namespaces is not None:
+            self.namespaces = QLineEdit(namespaces)
+            self.namespaces.setPlaceholderText("mon-namespace (plusieurs : séparés par des virgules)")
+            form.addRow("Namespace(s)", self.namespaces)
+        row = QHBoxLayout()
+        self.code = QLineEdit()
+        self.code.setEchoMode(QLineEdit.EchoMode.Password)
+        self.code.setPlaceholderText("code à usage unique" + ("" if code_required else " (facultatif ici)"))
+        row.addWidget(self.code, 1)
+        self.iam_url = iam_url or IAM_DEFAULT
+        get = QPushButton("Obtenir un code…")
+        get.setAutoDefault(False)
+        get.clicked.connect(lambda: open_passcode_page(self, self._iam_value()))
+        row.addWidget(get)
+        form.addRow("Code", row)
         lay.addLayout(form)
-        lay.addWidget(_hint("Clé API : ibmcloud iam api-key-create paas-explorer · jeton : ibmcloud iam oauth-tokens.\n"
-                            "La clé reste en mémoire jusqu'à la fermeture du programme : elle n'est jamais "
-                            "enregistrée sur le disque. Tu la retaperas au prochain lancement."))
-        adv = QGroupBox("Avancé")
-        af = QFormLayout(adv)
-        self.iam = QLineEdit(acc.get("iamUrl", IAM_DEFAULT))
-        self.cs = QLineEdit(acc.get("csUrl", CS_DEFAULT))
-        af.addRow("Point d'accès IAM", self.iam)
-        af.addRow("Point d'accès Containers", self.cs)
-        af.addRow("", _hint("Réseau privé IBM : https://private.iam.cloud.ibm.com · "
-                            "https://private.containers.cloud.ibm.com"))
-        lay.addWidget(adv)
+        lay.addWidget(_hint(code_hint or (
+            f"Le code s'obtient sur {passcode_url(self.iam_url)} (connexion avec ton compte d'entreprise) : il ne "
+            "sert qu'une fois et expire vite. Tu peux aussi coller un jeton OpenShift (sha256~…) copié depuis la "
+            "console, ou une clé API si tu en as une. Rien de tout cela n'est enregistré.")))
+        if cs_url is not None or (server is not None and name is not None):
+            adv = QGroupBox("Avancé")
+            af = QFormLayout(adv)
+            self.iam = QLineEdit(self.iam_url)
+            af.addRow("Point d'accès IAM", self.iam)
+            if cs_url is not None:
+                self.cs = QLineEdit(cs_url)
+                af.addRow("Point d'accès Containers", self.cs)
+            af.addRow("", _hint("Réseau privé IBM : https://private.iam.cloud.ibm.com"
+                                + (" · https://private.containers.cloud.ibm.com" if cs_url is not None else "")))
+            lay.addWidget(adv)
         bb = QDialogButtonBox()
-        ok = bb.addButton("Se connecter", QDialogButtonBox.ButtonRole.AcceptRole)
+        ok = bb.addButton("Se connecter" if code_required else "Enregistrer", QDialogButtonBox.ButtonRole.AcceptRole)
         ok.setDefault(True)
         bb.addButton("Annuler", QDialogButtonBox.ButtonRole.RejectRole)
         bb.accepted.connect(self._ok)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
-        (self.secret if account else self.name).setFocus()
+        first = next(w for w in (self.server if server == "" else None, self.namespaces if namespaces == "" else None,
+                                 self.code) if w is not None)
+        first.setFocus()
         self.result_data = None
 
+    def _iam_value(self):
+        return ((self.iam.text().strip() if self.iam is not None else "") or self.iam_url).rstrip("/")
+
+    def _https(self, label, url):
+        u = urlsplit(url)
+        if u.scheme != "https" or not u.hostname:
+            QMessageBox.warning(self, APP_NAME, f"{label} : l'adresse doit commencer par https://")
+            return False
+        return True
+
     def _ok(self):
-        name = self.name.text().strip().replace(SEP, ":")
-        secret = self.secret.text().strip()
-        if not name or name == DEMO_NAME:
-            QMessageBox.warning(self, APP_NAME, "Donne un nom au compte (autre que « Démonstration »).")
-            return
-        if not secret and not self.has_secret:
-            QMessageBox.warning(self, APP_NAME, "La clé API (ou le jeton) est obligatoire.")
-            return
-        urls = {}
-        for label, field, default in (("IAM", self.iam, IAM_DEFAULT), ("Containers", self.cs, CS_DEFAULT)):
-            url = (field.text().strip() or default).rstrip("/")
-            u = urlsplit(url)
-            if u.scheme != "https" or not u.hostname:
-                QMessageBox.warning(self, APP_NAME, f"Le point d'accès {label} doit commencer par https://")
+        r = {"code": self.code.text().strip()}
+        outside = []
+        if self.name is not None:
+            r["name"] = self.name.text().strip().replace(SEP, ":")
+            if not r["name"] or r["name"] == DEMO_NAME:
+                QMessageBox.warning(self, APP_NAME, "Donne un nom à la connexion (autre que « Démonstration »).")
                 return
-            urls[label] = url
-        outside = [u for u in urls.values() if not NET.permitted(urlsplit(u).hostname)]
-        if outside and not confirm(self, APP_NAME, "Ces adresses ne sont pas chez IBM Cloud :\n\n  "
-                                   + "\n  ".join(outside) + "\n\nTa clé API leur sera envoyée. Continuer ?",
-                                   ok="Continuer"):
+        if self.server is not None:
+            srv = self.server.text().strip().rstrip("/")
+            if srv and "://" not in srv:
+                srv = "https://" + srv
+            if not self._https("Serveur", srv):
+                return
+            r["server"] = srv
+            outside.append(srv)
+        if self.namespaces is not None:
+            nss = split_namespaces(self.namespaces.text())
+            bad = [n for n in nss if not NS_RE.match(n) or len(n) > 63]
+            if bad:
+                QMessageBox.warning(self, APP_NAME, "Nom de namespace invalide : " + ", ".join(bad))
+                return
+            r["namespaces"] = nss
+        if self.iam is not None:
+            r["iamUrl"] = self._iam_value()
+            if not self._https("Point d'accès IAM", r["iamUrl"]):
+                return
+            outside.append(r["iamUrl"])
+        if self.cs is not None:
+            r["csUrl"] = self.cs.text().strip().rstrip("/") or CS_DEFAULT
+            if not self._https("Point d'accès Containers", r["csUrl"]):
+                return
+            outside.append(r["csUrl"])
+        if self.code_required and not r["code"]:
+            QMessageBox.warning(self, APP_NAME, "Saisis le code à usage unique (bouton « Obtenir un code… »).")
             return
-        self.result_data = {"name": name, "mode": "token" if self.r_tok.isChecked() else "apikey", "secret": secret,
-                            "iamUrl": urls["IAM"], "csUrl": urls["Containers"]}
+        outside = [u for u in outside if not NET.permitted(urlsplit(u).hostname or "")]
+        if outside and not confirm(self, APP_NAME, "Ces adresses ne sont pas chez IBM Cloud :\n\n  "
+                                   + "\n  ".join(outside) + "\n\nTes codes de connexion leur seront envoyés. "
+                                   "Continuer ?", ok="Continuer"):
+            return
+        self.result_data = r
         self.accept()
+
+
+def ask_login(parent, **kw):
+    """Affiche la fenêtre de connexion ; renvoie les champs saisis, ou None si annulé."""
+    d = LoginDialog(parent, **kw)
+    return d.result_data if d.exec() == QDialog.DialogCode.Accepted else None
 
 
 class SettingsDialog(QDialog):
@@ -6262,6 +6550,8 @@ class PaaSWindow(QMainWindow):
         self.nav_items = {}
         self.term_views = []
         self._relays = []
+        self._pending = {}       # (compte, cluster) -> rappels en attente d'une connexion en cours
+        self._listing = set()    # comptes IBM dont la liste des clusters est en cours de chargement
 
         self._build_actions()
         self._build_menus()
@@ -6300,10 +6590,11 @@ class PaaSWindow(QMainWindow):
     def _build_actions(self):
         A = self._action
         mac = IS_MAC
-        self.act_add = A("Ajouter un compte IBM Cloud…", self.add_account, ["Ctrl+N"], "plus")
-        self.act_edit = A("Modifier le compte sélectionné…", self.edit_account)
-        self.act_remove = A("Supprimer le compte sélectionné", self.remove_account)
-        self.act_forget = A("Oublier les clés saisies", self.forget_secrets)
+        self.act_add = A("Nouvelle connexion à un cluster…", self.add_connection, ["Ctrl+N"], "plus")
+        self.act_add_ibm = A("Ajouter un compte IBM Cloud…", self.add_account)
+        self.act_edit = A("Modifier la connexion sélectionnée…", self.edit_account)
+        self.act_remove = A("Retirer la connexion sélectionnée", self.remove_account)
+        self.act_forget = A("Fermer toutes les sessions", self.forget_secrets)
         self.act_settings = A("Paramètres…", self.open_settings, ["Ctrl+,"], "settings")
         self.act_close_tab = A("Fermer l'onglet", lambda: self.close_tab(self.tabs.currentIndex()), ["Ctrl+W"])
         self.act_quit = A("Quitter", self.close, ["Ctrl+Q"])
@@ -6356,7 +6647,8 @@ class PaaSWindow(QMainWindow):
                 m.addSeparator() if it is None else m.addAction(it)
             style_menu(m)
             return m
-        menu("Fichier", [self.act_add, self.act_edit, self.act_remove, self.act_forget, None, self.act_settings, None,
+        menu("Fichier", [self.act_add, self.act_add_ibm, None, self.act_edit, self.act_remove, self.act_forget, None,
+                         self.act_settings, None,
                          self.act_close_tab, None, self.act_quit])
         menu("Édition", [self.act_copy, self.act_paste, self.act_select_all, None, self.act_find])
         menu("Affichage", [self.act_refresh, None, self.act_details, self.act_system, None, self.act_back,
@@ -6393,7 +6685,7 @@ class PaaSWindow(QMainWindow):
             lay.addSpacing(4)
             lay.addWidget(s)
             lay.addSpacing(4)
-        btn("add", "Compte", self.act_add)
+        btn("add", "Connexion", self.act_add)
         sep()
         btn("refresh", "Actualiser", self.act_refresh)
         sep()
@@ -6666,92 +6958,147 @@ class PaaSWindow(QMainWindow):
         elif not loc and str(item.data(0, Qt.ItemDataRole.UserRole)).startswith("G" + SEP):
             item.setExpanded(not item.isExpanded())
 
-    # ------------------------------------------------------------------ comptes
+    # ------------------------------------------------------------------ connexions et comptes
     def _load_accounts(self):
         for a in self.config.accounts:
             self._register_account(a)
 
+    @staticmethod
+    def _is_direct(meta):
+        return (meta or {}).get("kind") == "cluster"
+
+    def _acc_iid(self, name):
+        meta = self.account_meta.get(name)
+        return f"C{SEP}{name}{SEP}{DirectAccount.CID}" if self._is_direct(meta) else f"A{SEP}{name}"
+
     def _register_account(self, meta, index=None):
         name = meta["name"]
         self.account_meta[name] = meta
+        if self._is_direct(meta):
+            acc = self.accounts[name] = DirectAccount(meta)
+            self.clusters[(name, acc.CID)] = acc.cluster()
+            iid = self._acc_iid(name)
+            if iid not in self.nav_items:
+                self._nav_add(None, iid, name, "openshift", index=index,
+                              placeholder="Code à saisir (clic pour se connecter)")
+            return
         secret = SESSION_SECRETS.get(name)
         if secret:
-            self.accounts[name] = self._make_account(meta, secret)
+            self.accounts[name] = IbmAccount(name, apikey=secret, iam_url=meta.get("iamUrl"),
+                                             cs_url=meta.get("csUrl"))
         iid = f"A{SEP}{name}"
         if iid not in self.nav_items:
             self._nav_add(None, iid, name, "account", index=index,
-                          placeholder="Chargement…" if secret else "Clé API à saisir (clic pour la taper)")
-
-    @staticmethod
-    def _make_account(meta, secret):
-        if meta.get("mode") == "token":
-            return IbmAccount(meta["name"], token=secret, iam_url=meta.get("iamUrl"), cs_url=meta.get("csUrl"))
-        return IbmAccount(meta["name"], apikey=secret, iam_url=meta.get("iamUrl"), cs_url=meta.get("csUrl"))
+                          placeholder="Chargement…" if secret else "Code à saisir (clic pour se connecter)")
 
     def _ensure_account(self, name, ask=True):
-        """Compte prêt à l'emploi ; demande la clé (une fois par lancement) si besoin."""
+        """Compte IBM Cloud ouvert ; demande un code à usage unique (ou une clé API) si besoin."""
         acc = self.accounts.get(name)
         if acc is not None or not ask:
             return acc
         meta = self.account_meta.get(name)
         if not meta:
             return None
-        label = "Jeton IAM" if meta.get("mode") == "token" else "Clé API IBM Cloud"
-        text, ok = QInputDialog.getText(self, f"Compte « {name} »",
-                                        f"{label} du compte « {name} »\n(gardée en mémoire jusqu'à la fermeture, "
-                                        "jamais enregistrée)", QLineEdit.EchoMode.Password)
-        text = (text or "").strip()
-        if not ok or not text:
+        r = ask_login(self, title=f"Compte IBM Cloud « {name} »",
+                      intro="Comme « ibmcloud login --sso » : un code à usage unique suffit (pas de clé API).",
+                      iam_url=meta.get("iamUrl"))
+        if not r or not r.get("code"):
             return None
-        SESSION_SECRETS[name] = text
-        acc = self.accounts[name] = self._make_account(meta, text)
+        return self._open_ibm(meta, r["code"])
+
+    def _open_ibm(self, meta, code):
+        name = meta["name"]
+        if is_api_key(code):
+            SESSION_SECRETS[name] = code
+            acc = IbmAccount(name, apikey=code, iam_url=meta.get("iamUrl"), cs_url=meta.get("csUrl"))
+        else:
+            acc = IbmAccount(name, passcode=code, iam_url=meta.get("iamUrl"), cs_url=meta.get("csUrl"))
+        self.accounts[name] = acc
         self._nav_set_placeholder(f"A{SEP}{name}", "Chargement…")
         return acc
 
-    def add_account(self):
-        d = AccountDialog(self)
-        if d.exec() != QDialog.DialogCode.Accepted or not d.result_data:
-            return
-        self._store_account(d.result_data, None)
+    def add_connection(self):
+        """Connexion directe à un cluster OpenShift : serveur + namespace(s) + code à usage unique."""
+        r = ask_login(self, title="Nouvelle connexion à un cluster OpenShift",
+                      intro="Comme « oc login -u passcode -p <code> --server=<serveur> », puis « oc project "
+                            "<namespace> ». L'adresse du serveur figure dans la console IBM Cloud (« Master URL ») "
+                            "ou dans la commande de connexion de la console OpenShift.",
+                      name="", server="", namespaces="", iam_url=IAM_DEFAULT)
+        if r:
+            self._store_meta(r, None, r.get("code"))
 
-    def _store_account(self, r, old_name):
+    def add_account(self):
+        r = ask_login(self, title="Nouveau compte IBM Cloud",
+                      intro="Liste les clusters du compte, si tes droits IBM le permettent. Sinon, utilise plutôt "
+                            "« Nouvelle connexion à un cluster » (serveur + namespace).",
+                      name="Mon compte IBM Cloud", iam_url=IAM_DEFAULT, cs_url=CS_DEFAULT)
+        if r:
+            self._store_meta(dict(r, kind="ibm"), None, r.get("code"))
+
+    def _store_meta(self, r, old_name, code=None):
         meta = clean_account(r)
         if old_name:
+            secret = SESSION_SECRETS.pop(old_name, None)
             self._forget_account(old_name)
-            if old_name != meta["name"]:
-                SESSION_SECRETS[meta["name"]] = SESSION_SECRETS.pop(old_name, "")
-        if r.get("secret"):
-            SESSION_SECRETS[meta["name"]] = r["secret"]
+            if secret and not code:
+                SESSION_SECRETS[meta["name"]] = secret
         self._forget_account(meta["name"])
         self.config.data["accounts"] = [a for a in self.config.accounts if a["name"] not in (meta["name"], old_name)]
         self.config.data["accounts"].append(meta)
+        self.account_meta.pop(old_name, None)
         self._save()
         self._register_account(meta)
+        if self._is_direct(meta):
+            loc = {"view": "cluster", "acc": meta["name"], "cid": DirectAccount.CID}
+            if code:
+                def failed(e):
+                    QMessageBox.warning(self, APP_NAME, f"Connexion à « {meta['name']} » impossible :\n\n{e}")
+                    self.navigate({"view": "home"}) if self.loc.get("view") != "home" else self.load_view()
+                self._connect(meta["name"], DirectAccount.CID,
+                              lambda kube: (self._fill_cluster(meta["name"], DirectAccount.CID), self.navigate(loc)),
+                              on_err=failed, code=code)
+                return
+            self.navigate(loc)
+            return
+        if code and meta["name"] not in self.accounts:
+            self._open_ibm(meta, code)
         it = self.nav_items.get(f"A{SEP}{meta['name']}")
-        if it is not None:
+        if it is not None and meta["name"] in self.accounts:
             it.setExpanded(True)
         self.navigate({"view": "account", "acc": meta["name"]})
 
     def _selected_account(self):
         name = self.loc.get("acc")
+        if self.loc.get("view") == "home":
+            sel = self.listview.selected()
+            name = sel[0]["id"] if sel else None
         return name if name and name != DEMO_NAME and name in self.account_meta else None
 
     def edit_account(self):
         name = self._selected_account()
         if not name:
-            QMessageBox.information(self, APP_NAME, "Sélectionne d'abord un compte dans le volet de navigation.")
+            QMessageBox.information(self, APP_NAME, "Sélectionne d'abord une connexion ou un compte.")
             return
-        d = AccountDialog(self, self.account_meta[name], has_secret=bool(SESSION_SECRETS.get(name)))
-        if d.exec() == QDialog.DialogCode.Accepted and d.result_data:
-            self._store_account(d.result_data, name)
+        meta = self.account_meta[name]
+        if self._is_direct(meta):
+            r = ask_login(self, title=f"Connexion « {name} »", name=name, server=meta["server"],
+                          namespaces=", ".join(meta.get("namespaces", [])), iam_url=meta.get("iamUrl"),
+                          code_required=False)
+        else:
+            r = ask_login(self, title=f"Compte IBM Cloud « {name} »", name=name, iam_url=meta.get("iamUrl"),
+                          cs_url=meta.get("csUrl"), code_required=False)
+            if r:
+                r["kind"] = "ibm"
+        if r:
+            self._store_meta(r, name, r.get("code"))
 
     def remove_account(self):
         name = self._selected_account()
         if not name:
-            QMessageBox.information(self, APP_NAME, "Sélectionne d'abord un compte dans le volet de navigation.")
+            QMessageBox.information(self, APP_NAME, "Sélectionne d'abord une connexion ou un compte.")
             return
-        if not confirm(self, APP_NAME, f"Retirer le compte « {name} » de la liste ?\n\n"
-                                       "(Rien n'est supprimé chez IBM Cloud.)", ok="Retirer"):
+        if not confirm(self, APP_NAME, f"Retirer « {name} » de la liste ?\n\n(Rien n'est supprimé chez IBM Cloud "
+                                       "ni sur le cluster.)", ok="Retirer"):
             return
         self._forget_account(name)
         SESSION_SECRETS.pop(name, None)
@@ -6761,21 +7108,23 @@ class PaaSWindow(QMainWindow):
         self.navigate({"view": "home"})
 
     def _forget_account(self, name):
+        iid = self._acc_iid(name) if name in self.account_meta else None
         self.accounts.pop(name, None)
         for k in [k for k in self.kubes if k[0] == name]:
             self.kubes.pop(k)
         for k in [k for k in self.clusters if k[0] == name]:
             self.clusters.pop(k)
-        self._nav_remove(f"A{SEP}{name}")
+        for i in {iid, f"A{SEP}{name}", f"C{SEP}{name}{SEP}{DirectAccount.CID}"} - {None}:
+            self._nav_remove(i)
 
     def forget_secrets(self):
-        names = [n for n in self.account_meta if n in SESSION_SECRETS]
+        """Ferme toutes les sessions : codes, jetons et clés sont oubliés (ils seront redemandés)."""
         SESSION_SECRETS.clear()
-        for n in names:
-            self._forget_account(n)
-            self._register_account(self.account_meta[n])
-        self.flash("Clés oubliées : elles seront redemandées.")
-        if self.loc.get("acc") in names:
+        for name, meta in list(self.account_meta.items()):
+            self._forget_account(name)
+            self._register_account(meta)
+        self.flash("Sessions fermées : un nouveau code sera demandé.")
+        if self.loc.get("acc") in self.account_meta:
             self.navigate({"view": "home"})
 
     def toggle_demo(self, on):
@@ -6899,7 +7248,8 @@ class PaaSWindow(QMainWindow):
     def go_up(self):
         loc = self.loc
         v = loc["view"]
-        if v == "account":
+        direct = self._is_direct(self.account_meta.get(loc.get("acc")))
+        if v == "account" or (v == "cluster" and direct):
             self.navigate({"view": "home"})
         elif v == "cluster":
             self.navigate({"view": "account", "acc": loc["acc"]})
@@ -6943,8 +7293,8 @@ class PaaSWindow(QMainWindow):
     def _render_crumbs(self):
         drop_layout_items(self.crumb_lay)
         loc = self.loc
-        parts = [("Comptes IBM Cloud", {"view": "home"})]
-        if loc.get("acc"):
+        parts = [("Connexions", {"view": "home"})]
+        if loc.get("acc") and not self._is_direct(self.account_meta.get(loc["acc"])):
             parts.append((loc["acc"], {"view": "account", "acc": loc["acc"]}))
         if loc.get("cid"):
             cl = self.clusters.get((loc["acc"], loc["cid"]), {})
@@ -6969,7 +7319,7 @@ class PaaSWindow(QMainWindow):
             self.crumb_lay.addWidget(b)
         self.crumb_lay.addStretch(1)
         what = {"list": label, "topology": "la topologie", "account": "les clusters", "cluster": "les namespaces",
-                "all": "les types", "home": "les comptes", "helm": "les charts", "clusterres": "les ressources"}.get(
+                "all": "les types", "home": "les connexions", "helm": "les charts", "clusterres": "les ressources"}.get(
             loc["view"], "")
         self.search.setPlaceholderText(f"Rechercher dans {what}" if what else "Rechercher")
 
@@ -6989,7 +7339,9 @@ class PaaSWindow(QMainWindow):
         loc = self.loc
         if loc.get("cid"):
             cl = self.clusters.get((loc["acc"], loc["cid"]), {})
-            state = "connecté" if (loc["acc"], loc["cid"]) in self.kubes else "non connecté"
+            kube = self.kubes.get((loc["acc"], loc["cid"]))
+            state = (f"connecté ({kube.user})" if getattr(kube, "user", "") else "connecté") if kube \
+                else "non connecté"
             self.st_conn.setText(f"{cl.get('name')} · {'OpenShift' if cl.get('type') == 'openshift' else 'Kubernetes'} "
                                  f"{cl.get('version', '')} · {cl.get('region', '')} · {state}")
             self.act_private.blockSignals(True)
@@ -6999,7 +7351,8 @@ class PaaSWindow(QMainWindow):
             self.st_conn.setText(f"Compte : {loc['acc']}")
         else:
             self.st_conn.setText("Non connecté")
-        self.act_private.setEnabled(bool(loc.get("cid")) and loc.get("acc") != DEMO_NAME)
+        cl = self.clusters.get((loc.get("acc"), loc.get("cid")), {})
+        self.act_private.setEnabled(bool(cl.get("private")) and loc.get("acc") != DEMO_NAME)
         self.act_reconnect.setEnabled(bool(loc.get("cid")))
         self.act_copy_cli.setEnabled(bool(loc.get("cid")))
 
@@ -7039,12 +7392,14 @@ class PaaSWindow(QMainWindow):
         ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(ic)
         t = QLabel(title)
+        t.setTextFormat(Qt.TextFormat.PlainText)
         t.setObjectName("h1")
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         t.setWordWrap(True)
         lay.addWidget(t)
         if text:
             s = QLabel(text)
+            s.setTextFormat(Qt.TextFormat.PlainText)
             s.setObjectName("sub")
             s.setWordWrap(True)
             s.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -7066,19 +7421,32 @@ class PaaSWindow(QMainWindow):
         t = p[0]
         if t == "A":
             name = p[1]
+            if name in self._listing:               # liste déjà demandée : on attend sa réponse
+                return
             acc = self._ensure_account(name)
             if acc is None:
                 self.nav_items[iid].setExpanded(False)
                 return
+            self._listing.add(name)
 
             def err(e):
-                self._nav_set_placeholder(iid, "Erreur — voir la barre d'état")
-                self.flash(f"Erreur IBM Cloud : {e}", 15000)
+                self._listing.discard(name)
+                if getattr(e, "status", None) in (400, 401) and name != DEMO_NAME:
+                    self.accounts.pop(name, None)            # code refusé ou session finie : on redemandera
+                    self._nav_set_placeholder(iid, "Code à saisir (clic pour se connecter)")
+                    self.nav_items[iid].setExpanded(False)
+                else:
+                    self._nav_set_placeholder(iid, "Erreur — voir la barre d'état")
+                self.flash(f"IBM Cloud : {e}", 15000)
                 if self.loc.get("view") == "account" and self.loc.get("acc") == name:
-                    self._show_message("Clusters indisponibles", str(e), "err", [("Réessayer", self.refresh)])
-            self.bg(acc.list_clusters, lambda cls: self._fill_clusters(name, cls), err)
+                    buttons = [("Réessayer", self.refresh)]
+                    if getattr(e, "status", None) == 403:
+                        buttons = [("Nouvelle connexion à un cluster…", self.add_connection)]
+                    self._show_message("Clusters indisponibles", str(e), "err", buttons)
+            self.bg(acc.list_clusters, lambda cls: (self._listing.discard(name), self._fill_clusters(name, cls)), err)
         elif t == "C":
-            self._connect(p[1], p[2], lambda kube: self._fill_cluster(p[1], p[2]))
+            self._connect(p[1], p[2], lambda kube: self._fill_cluster(p[1], p[2]),
+                          on_err=lambda e: self.nav_items.get(iid) and self.nav_items[iid].setExpanded(False))
         elif t == "N":
             self._fill_namespace(p[1], p[2], p[3])
 
@@ -7098,39 +7466,116 @@ class PaaSWindow(QMainWindow):
         if self.loc.get("view") == "account" and self.loc.get("acc") == acc:
             self.load_view()
 
-    def _connect(self, acc, cid, then, on_err=None):
+    def _connect(self, acc, cid, then, on_err=None, code=None):
         key = (acc, cid)
         if key in self.kubes:
             then(self.kubes[key])
             return
+        if key in self._pending:                     # connexion déjà en cours : on attend son résultat
+            self._pending[key].append((then, on_err))
+            return
         account = self.accounts.get(acc)
         cluster = self.clusters.get(key)
         if not account or not cluster:
+            if on_err:
+                on_err(ErrText("Connexion indisponible : rouvre le compte ou la connexion."))
             return
-        private = bool(self.config.cluster_pref(cid).get("private", False))
+        private = bool(self.config.cluster_pref(cid).get("private", False)) and bool(cluster.get("private"))
+        ciid = f"C{SEP}{acc}{SEP}{cid}"
+        self._pending[key] = [(then, on_err)]
+        needs = getattr(account, "needs_code", None)
+        if not code and needs and needs(cluster, private):
+            r = self._ask_cluster_code(acc, cid)
+            if not r or not r.get("code"):
+                self._nav_set_placeholder(ciid, "Code à saisir (clic pour se connecter)")
+                for _then, fail in self._pending.pop(key, []):
+                    if fail:
+                        fail(ErrText("Connexion annulée : il faut un code à usage unique."))
+                return
+            code = r["code"]
+            cluster = self.clusters.get(key, cluster)
+        meta = self.account_meta.get(acc, {})
+        declared = meta.get("namespaces", []) if self._is_direct(meta) else \
+            self.config.cluster_pref(cid).get("namespaces", [])
         self.flash(f"Connexion à {cluster['name']}…", 30000)
+        self._nav_set_placeholder(ciid, "Connexion…")
 
         def work():
-            kube = account.connect(cluster, private)
-            names = [n["metadata"]["name"] for n in kube.list(CATALOG_BY_KEY["namespaces"])]
-            return kube, sorted(names)
+            kube = account.connect(cluster, private, code) if code else account.connect(cluster, private)
+            names, how = kube.namespaces(declared)
+            return kube, names, how
 
         def ok(res):
-            kube, nss = res
+            kube, nss, how = res
             self.kubes[key] = kube
             self.namespaces[key] = nss
-            self.flash(f"Connecté à {cluster['name']} ({len(nss)} namespaces).")
+            who = f" en tant que {kube.user}" if getattr(kube, "user", "") else ""
+            note = {"tous": "", "projets": " (tes projets)", "déclarés": " (indiqués dans la connexion)"}.get(how, "")
+            self.flash(f"Connecté à {cluster['name']}{who} : {len(nss)} namespace(s){note}.", 8000)
             self._update_conn()
-            then(kube)
+            for then_cb, _fail in self._pending.pop(key, []):
+                then_cb(kube)
 
         def err(e):
-            self._nav_set_placeholder(f"C{SEP}{acc}{SEP}{cid}", "Échec de connexion")
+            needs_now = needs and needs(cluster, private)
+            self._nav_set_placeholder(ciid, "Code à saisir (clic pour se connecter)" if needs_now
+                                      else "Échec de connexion")
             self.flash(f"Connexion impossible : {e}", 20000)
-            if on_err:
-                on_err(e)
+            waiting = self._pending.pop(key, [])
+            if any(fail for _then, fail in waiting):
+                for _then, fail in waiting:
+                    if fail:
+                        fail(e)
             else:
                 QMessageBox.warning(self, APP_NAME, f"Connexion au cluster {cluster['name']} impossible :\n\n{e}")
         self.bg(work, ok, err)
+
+    def _ask_cluster_code(self, acc, cid):
+        """Fenêtre du code pour un cluster ; pour une connexion directe, serveur et namespaces y sont modifiables."""
+        meta = self.account_meta.get(acc, {})
+        cluster = self.clusters[(acc, cid)]
+        if self._is_direct(meta):
+            r = ask_login(self, title=f"Connexion à « {acc} »",
+                          intro="Comme « oc login -u passcode -p <code> --server=<serveur> ».",
+                          server=meta["server"], namespaces=", ".join(meta.get("namespaces", [])),
+                          iam_url=meta.get("iamUrl"))
+            if r and (r["server"] != meta["server"] or r["namespaces"] != meta.get("namespaces", [])):
+                new = clean_account(dict(meta, server=r["server"], namespaces=r["namespaces"]))
+                self.config.data["accounts"] = [new if a["name"] == acc else a for a in self.config.accounts]
+                self.account_meta[acc] = new
+                self.accounts[acc].update(new)
+                self.clusters[(acc, cid)] = self.accounts[acc].cluster()
+                self._save()
+            return r
+        prefs = self.config.cluster_pref(cid)
+        account = self.accounts.get(acc)
+        r = ask_login(self, title=f"Cluster « {cluster['name']} »",
+                      intro="Comme « oc login -u passcode » : il faut un nouveau code (chacun ne sert qu'une fois). "
+                            "Indique tes namespaces si le cluster ne te laisse pas les lister.",
+                      namespaces=", ".join(prefs.get("namespaces", [])),
+                      iam_url=getattr(account, "iam_url", IAM_DEFAULT))
+        if r and r.get("namespaces") != prefs.get("namespaces", []):
+            prefs["namespaces"] = r.get("namespaces", [])
+            self._save()
+        return r
+
+    def _drop_session(self, key):
+        """Session refusée (HTTP 401) : on oublie le jeton ; la prochaine connexion redemandera un code."""
+        self.kubes.pop(key, None)
+        acc, cl = self.accounts.get(key[0]), self.clusters.get(key)
+        if acc is not None and cl is not None and hasattr(acc, "invalidate"):
+            acc.invalidate(cl)
+        self._update_conn()
+
+    def _load_error(self, seq, title, e):
+        if seq != self._load_seq:
+            return
+        if getattr(e, "status", None) == 401 or "HTTP 401" in str(e):
+            self._drop_session((self.loc.get("acc"), self.loc.get("cid")))
+            self._show_message("Session expirée", "Le cluster n'accepte plus ta session. Reconnecte-toi avec un "
+                               "nouveau code à usage unique.", "warn", [("Se reconnecter…", self.load_view)])
+            return
+        self._show_message(title, str(e), "err", [("Réessayer", self.load_view)])
 
     def _fill_cluster(self, acc, cid):
         ciid = f"C{SEP}{acc}{SEP}{cid}"
@@ -7202,7 +7647,7 @@ class PaaSWindow(QMainWindow):
     def reconnect(self):
         loc = self.loc
         if loc.get("cid"):
-            self.kubes.pop((loc["acc"], loc["cid"]), None)
+            self._drop_session((loc["acc"], loc["cid"]))
             self._shown_loc = None
             self.load_view()
 
@@ -7234,31 +7679,45 @@ class PaaSWindow(QMainWindow):
                 rows = []
                 for a in names:
                     meta = self.account_meta.get(a, {})
-                    auth = ("Démonstration" if a == DEMO_NAME else
-                            ("Jeton IAM" if meta.get("mode") == "token" else "Clé API"))
-                    state = "simulé" if a == DEMO_NAME else ("clé saisie" if a in SESSION_SECRETS else "clé à saisir")
-                    rows.append({"id": a, "values": [a, auth, state], "icon": "account",
-                                 "kind_label": "Compte IBM Cloud", "level": "ok" if state != "clé à saisir" else "off",
-                                 "props": [("Point d'accès IAM", meta.get("iamUrl", "")),
-                                           ("Point d'accès Containers", meta.get("csUrl", ""))] if meta else []})
-                self.listview.configure_columns([("Compte", 320, "w"), ("Authentification", 160, "w"),
-                                                 ("Clé", 140, "w")])
+                    if a == DEMO_NAME:
+                        vals, icon, lvl, props = [a, "Démonstration", "données simulées", "", "simulé"], "account", \
+                            "ok", []
+                    elif self._is_direct(meta):
+                        on = (a, DirectAccount.CID) in self.kubes
+                        vals = [a, "Cluster OpenShift", meta["server"], ", ".join(meta.get("namespaces", [])),
+                                "connecté" if on else "code à saisir"]
+                        icon, lvl = "openshift", "ok" if on else "off"
+                        props = [("Serveur", meta["server"]), ("Namespaces", ", ".join(meta.get("namespaces", [])))]
+                    else:
+                        on = a in self.accounts
+                        vals = [a, "Compte IBM Cloud", meta.get("csUrl", ""), "", "session ouverte" if on
+                                else "code à saisir"]
+                        icon, lvl = "account", "ok" if on else "off"
+                        props = [("Point d'accès IAM", meta.get("iamUrl", "")),
+                                 ("Point d'accès Containers", meta.get("csUrl", ""))]
+                    rows.append({"id": a, "values": vals, "icon": icon, "level": lvl, "props": props,
+                                 "kind_label": vals[1]})
+                self.listview.configure_columns([("Nom", 240, "w"), ("Type", 150, "w"), ("Adresse", 360, "w"),
+                                                 ("Namespaces", 200, "w"), ("État", 120, "w")])
                 self.listview.set_rows(rows)
                 self._show(self.listview)
             else:
                 self._show_message(f"Bienvenue dans {APP_NAME}",
-                                   "Ajoute un compte IBM Cloud (clé API) pour parcourir tes clusters Kubernetes et "
-                                   "OpenShift : namespaces, pods, terminal, logs, charts Helm et objets.\n\n"
-                                   "Pour essayer sans rien connecter : menu Aide › Mode démonstration.",
-                                   "welcome", [("Ajouter un compte IBM Cloud…", self.add_account),
+                                   "Ajoute une connexion à un cluster OpenShift : adresse du serveur, namespace et "
+                                   "code à usage unique (comme « oc login -u passcode »). Pas besoin de clé API.\n\n"
+                                   "Si tes droits IBM Cloud permettent de lister les clusters, tu peux aussi ajouter "
+                                   "le compte IBM Cloud entier. Pour essayer sans rien connecter : Aide › Mode "
+                                   "démonstration.",
+                                   "welcome", [("Nouvelle connexion à un cluster…", self.add_connection),
+                                               ("Ajouter un compte IBM Cloud…", self.add_account),
                                                ("Essayer le mode démonstration", lambda: self.act_demo.setChecked(True))])
             return
         if v == "account":
             acc = loc["acc"]
             if acc not in self.accounts:
-                self._show_message(f"Compte « {acc} »", "La clé API de ce compte n'a pas encore été saisie depuis "
-                                   "le lancement du programme.", "account",
-                                   [("Saisir la clé…", lambda: self._expand_account(acc))])
+                self._show_message(f"Compte « {acc} »", "Ouvre une session avec un code à usage unique (comme "
+                                   "« ibmcloud login --sso »).", "account",
+                                   [("Se connecter…", lambda: self._expand_account(acc))])
                 return
             cls = [c for (a, _), c in self.clusters.items() if a == acc]
             iid = f"A{SEP}{acc}"
@@ -7299,7 +7758,10 @@ class PaaSWindow(QMainWindow):
 
             def failed(e):
                 if self.loc is loc:
-                    self._show_message("Connexion impossible", str(e), "err", [("Réessayer", self.load_view)])
+                    cancelled = str(e).startswith("Connexion annulée")
+                    self._show_message("Pas encore connecté" if cancelled else "Connexion impossible", str(e),
+                                       "openshift" if cancelled else "err",
+                                       [("Se connecter…" if cancelled else "Réessayer", self.load_view)])
             self._connect(loc["acc"], loc["cid"], lambda kube: self.loc is loc and self._after_connect(loc),
                           on_err=failed)
             return
@@ -7329,6 +7791,16 @@ class PaaSWindow(QMainWindow):
             self._load_helm(seq, kube, loc)
         elif v == "all":
             self._load_all(seq, kube, loc)
+
+    def _reopen_account(self, name):
+        """Nouvelle session IBM Cloud (nouveau code) pour ce compte."""
+        meta = self.account_meta.get(name)
+        if not meta or self._is_direct(meta):
+            return
+        SESSION_SECRETS.pop(name, None)
+        self._forget_account(name)
+        self._register_account(meta)
+        self.navigate({"view": "account", "acc": name}) if self.loc.get("acc") != name else self.load_view()
 
     def _expand_account(self, name):
         if self._ensure_account(name) is not None:
@@ -7361,10 +7833,16 @@ class PaaSWindow(QMainWindow):
             self._show(self.listview)
             self._apply_filter()
 
+        key = (self.loc.get("acc"), self.loc.get("cid"))
+
         def err(e):
-            if seq == self._load_seq:
-                self._show_message(f"Impossible de lister {res['label']}", str(e), "err",
-                                   [("Réessayer", self.load_view)])
+            if seq != self._load_seq:
+                return
+            if ns_mode and getattr(e, "status", None) == 403:       # pas le droit de lister : ceux qu'on connaît
+                ok([{"metadata": {"name": n, "uid": n}, "status": {"phase": ""}}
+                    for n in self.namespaces.get(key, [])])
+                return
+            self._load_error(seq, f"Impossible de lister {res['label']}", e)
         self.bg(lambda: kube.list(res, ns), ok, err)
 
     @staticmethod
@@ -7415,8 +7893,7 @@ class PaaSWindow(QMainWindow):
                 self._show(self.overview)
 
         def err(e):
-            if seq == self._load_seq:
-                self._show_message("Vue d'ensemble indisponible", str(e), "err", [("Réessayer", self.load_view)])
+            self._load_error(seq, "Vue d'ensemble indisponible", e)
         self.bg(work, ok, err)
 
     def _load_topology(self, seq, kube, loc):
@@ -7435,8 +7912,7 @@ class PaaSWindow(QMainWindow):
                 self._show(self.topology)
 
         def err(e):
-            if seq == self._load_seq:
-                self._show_message("Topologie indisponible", str(e), "err", [("Réessayer", self.load_view)])
+            self._load_error(seq, "Topologie indisponible", e)
         self.bg(work, ok, err)
 
     def _load_helm(self, seq, kube, loc):
@@ -7465,8 +7941,7 @@ class PaaSWindow(QMainWindow):
             self._show(self.listview)
 
         def err(e):
-            if seq == self._load_seq:
-                self._show_message("Charts Helm indisponibles", str(e), "err", [("Réessayer", self.load_view)])
+            self._load_error(seq, "Charts Helm indisponibles", e)
         self.bg(lambda: helm_releases(kube.list(CATALOG_BY_KEY["secrets"], loc["ns"], "owner=helm")), ok, err)
 
     def _load_all(self, seq, kube, loc):
@@ -7495,8 +7970,7 @@ class PaaSWindow(QMainWindow):
             self._count_all(seq, kube, ns, rows)
 
         def err(e):
-            if seq == self._load_seq:
-                self._show_message("Types d'objets indisponibles", str(e), "err", [("Réessayer", self.load_view)])
+            self._load_error(seq, "Types d'objets indisponibles", e)
         self.bg(kube.discovery, ok, err)
 
     def _count_all(self, seq, kube, ns, rows):
@@ -7603,7 +8077,10 @@ class PaaSWindow(QMainWindow):
         r = sel[0]
         loc = self.loc
         if loc["view"] == "home":
-            self.navigate({"view": "account", "acc": r["id"]})
+            if self._is_direct(self.account_meta.get(r["id"])):
+                self.navigate({"view": "cluster", "acc": r["id"], "cid": DirectAccount.CID})
+            else:
+                self.navigate({"view": "account", "acc": r["id"]})
         elif loc["view"] == "account" and r.get("cluster"):
             self.navigate({"view": "cluster", "acc": loc["acc"], "cid": r["cluster"]["id"]})
         elif loc["view"] == "cluster" and r.get("obj"):
@@ -7665,7 +8142,7 @@ class PaaSWindow(QMainWindow):
                 m.addAction(self.act_allow)
         if self.loc["view"] == "account" and sel and sel[0].get("cluster"):
             m.addAction(Glyphs.get("copy"), "Copier la commande de connexion (CLI)",
-                        lambda c=sel[0]["cluster"]: self._copy(self._cli_for(c)))
+                        lambda c=sel[0]["cluster"]: self._copy(self._cli_for(c, self.loc.get("acc"))))
         m.addSeparator()
         m.addAction(self.act_refresh)
         popup(m, gpos)
@@ -7687,12 +8164,17 @@ class PaaSWindow(QMainWindow):
             cl = self.clusters.get((loc["acc"], loc["cid"]))
             if cl:
                 m.addAction(Glyphs.get("copy"), "Copier la commande de connexion (CLI)",
-                            lambda: self._copy(self._cli_for(cl)))
-            m.addAction("Reconnecter", lambda: (self.kubes.pop((loc["acc"], loc["cid"]), None),
-                                                self.navigate(loc) if self.loc != loc else self.reconnect()))
-        if str(iid).startswith("A" + SEP) and loc and loc["acc"] != DEMO_NAME:
-            m.addAction("Modifier le compte…", lambda: (self.navigate(loc), self.edit_account()))
-            m.addAction("Retirer le compte", lambda: (self.navigate(loc), self.remove_account()))
+                            lambda: self._copy(self._cli_for(cl, loc["acc"])))
+            m.addAction(Glyphs.get("refresh"), "Se reconnecter (nouveau code)",
+                        lambda: (self._drop_session((loc["acc"], loc["cid"])), self.navigate(loc)
+                                 if self.loc != loc else self.load_view()))
+        if loc and loc["acc"] in self.account_meta and loc["view"] in ("account", "cluster") \
+                and (loc["view"] == "account" or self._is_direct(self.account_meta[loc["acc"]])):
+            if loc["view"] == "account":
+                m.addAction(Glyphs.get("refresh"), "Se reconnecter (nouveau code)",
+                            lambda: self._reopen_account(loc["acc"]))
+            m.addAction("Modifier…", lambda: (self.navigate(loc), self.edit_account()))
+            m.addAction("Retirer", lambda: (self.navigate(loc), self.remove_account()))
         m.addSeparator()
         m.addAction(self.act_refresh)
         popup(m, gpos)
@@ -7701,10 +8183,13 @@ class PaaSWindow(QMainWindow):
         copy_text(text)
         self.flash("Copié dans le presse-papiers.")
 
-    @staticmethod
-    def _cli_for(cl):
+    def _cli_for(self, cl, acc=None):
         if cl["type"] == "openshift":
-            return f'oc login -u apikey -p "$IBMCLOUD_API_KEY" --server {cl["public"] or cl["private"]}'
+            cmd = f'oc login -u passcode -p "<code>" --server={cl["public"] or cl["private"]}'
+            meta = self.account_meta.get(acc or self.loc.get("acc"), {})
+            nss = meta.get("namespaces") if self._is_direct(meta) else \
+                self.config.cluster_pref(cl["id"]).get("namespaces")
+            return cmd + (f" && oc project {nss[0]}" if nss else "")
         return f"ibmcloud ks cluster config --cluster {cl['id']}"
 
     def copy_cli(self):
@@ -7968,7 +8453,8 @@ class PaaSWindow(QMainWindow):
                           "Explorateur de clusters IBM Cloud Kubernetes Service et Red Hat OpenShift on IBM Cloud, "
                           "d'après le PaaSExplorer d'origine.<br><br>"
                           f"{version_details()}<br>"
-                          "Clés API : en mémoire seulement, jamais enregistrées.<br>"
+                          "Codes à usage unique, jetons et clés : en mémoire seulement, jamais "
+                          "enregistrés.<br>"
                           f"Réglages : {short_path(self.config.path)}<br>"
                           f"Script : {short_path(os.path.abspath(__file__))}")
 
